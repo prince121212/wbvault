@@ -1,0 +1,4 @@
+#!/bin/sh
+# wbvault 启动器
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$DIR/../wbvault.py" "$@"
