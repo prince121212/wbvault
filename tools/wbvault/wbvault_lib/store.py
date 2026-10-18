@@ -24,6 +24,7 @@ from .authfile import (
     sha256_bytes,
 )
 from .paths import ensure_private_dir
+from .profile import nickname_for
 
 INDEX_VERSION = 1
 
@@ -82,7 +83,7 @@ class Vault:
         return self.snapshots_dir / ("%s.info" % uid)
 
     def find(self, selector: str) -> Optional[Dict[str, Any]]:
-        """支持：完整 uid / uid 前缀（>=4 位）/ 别名（忽略大小写）/ uin。"""
+        """支持：完整 uid / uid 前缀（>=4 位）/ 别名 / 邮箱 / uin（都忽略大小写）。"""
         needle = (selector or "").strip()
         if not needle:
             return None
@@ -90,6 +91,9 @@ class Vault:
         lowered = needle.lower()
         for entry in entries:
             if entry.get("alias", "").lower() == lowered:
+                return entry
+        for entry in entries:
+            if str(entry.get("email") or "").lower() == lowered:
                 return entry
         for entry in entries:
             if entry.get("uid") == needle:
@@ -152,10 +156,37 @@ class Vault:
             existing[key] = value
         if alias is not None:
             existing["alias"] = alias
+        email = nickname_for(state.uid)
+        if email:
+            existing["email"] = email
         existing["lastSeenActiveAt"] = now
         data["activeUid"] = state.uid
         self.save()
         return existing
+
+    def refresh_email(self, uid: str) -> Optional[str]:
+        """登录态没变、但本机账号档案里补上了邮箱时，把邮箱写进账号库。"""
+        email = nickname_for(uid)
+        if not email:
+            return None
+        entry = next((e for e in self.entries() if e.get("uid") == uid), None)
+        if not entry or entry.get("email") == email:
+            return None
+        entry["email"] = email
+        self.save()
+        return email
+
+    def set_email(self, selector: str, email: str) -> Dict[str, Any]:
+        entry = self.find(selector)
+        if not entry:
+            raise VaultError("找不到账号：%s" % selector)
+        value = email.strip()
+        if value:
+            entry["email"] = value
+        else:
+            entry.pop("email", None)
+        self.save()
+        return entry
 
     def set_alias(self, selector: str, alias: str) -> Dict[str, Any]:
         entry = self.find(selector)

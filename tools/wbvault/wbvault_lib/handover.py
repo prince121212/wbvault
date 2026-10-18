@@ -101,16 +101,22 @@ def backup_db(path: Path, vault: Vault, keep: int = 5) -> Path:
 
 
 def current_session_id(uid: str) -> Optional[str]:
-    """从 <uid>/startup-route.json 取当前打开的会话。"""
+    """从 <uid>/startup-route.json 取当前打开的会话。
+
+    path 形如 `/conversation/<id>?startIntentToken=6`，问号后面是路由参数，
+    不是会话 id 的一部分，必须剥掉，否则按 id 查库查不到。
+    """
     route = Path.home() / ".workbuddy-ai" / uid / "startup-route.json"
     try:
         data = json.loads(route.read_text("utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     path = str(data.get("path") or "")
-    if "/conversation/" in path:
-        return path.rsplit("/", 1)[-1] or None
-    return None
+    if "/conversation/" not in path:
+        return None
+    tail = path.split("/conversation/", 1)[1]
+    tail = tail.split("?", 1)[0].split("#", 1)[0].strip("/")
+    return tail or None
 
 
 def latest_session_id(conn: sqlite3.Connection, uid: str) -> Optional[str]:
@@ -130,7 +136,11 @@ def resolve_session(
         if not sid:
             raise HandoverError("找不到当前会话")
     else:
-        sid = selector
+        # 允许直接粘贴带参数的路由片段：/conversation/<id>?x=1
+        sid = str(selector).strip().rstrip("/")
+        if sid.startswith("conversation/"):
+            sid = sid.split("conversation/", 1)[1]
+        sid = sid.split("?", 1)[0].split("#", 1)[0]
     row = conn.execute(
         "select id, user_id, title, cwd, status, transport from sessions where id = ? or id like ?",
         (sid, sid + "%"),
@@ -179,9 +189,15 @@ def handover(
     dry_run: bool = False,
     allow_cross_domain: bool = False,
 ) -> HandoverResult:
-    conn = connect(db)
     try:
-        row = resolve_session(conn, selector, vault.active_uid() or "")
+        conn = connect(db)
+    except HandoverError as exc:
+        return HandoverResult("error", str(exc))
+    try:
+        try:
+            row = resolve_session(conn, selector, vault.active_uid() or "")
+        except HandoverError as exc:
+            return HandoverResult("error", str(exc))
         session_id = row["id"]
         from_uid = row["user_id"]
         title = row["title"] or "(无标题)"
@@ -209,9 +225,18 @@ def handover(
             )
 
         backup = backup_db(db, vault)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        touch = "last_activity_at" in columns
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("update sessions set user_id = ? where id = ?", (to_uid, session_id))
+            if touch:
+                # 顺手把它顶到侧边栏最上面：切过去第一眼就能看到
+                conn.execute(
+                    "update sessions set user_id = ?, last_activity_at = ? where id = ?",
+                    (to_uid, int(time.time() * 1000), session_id),
+                )
+            else:
+                conn.execute("update sessions set user_id = ? where id = ?", (to_uid, session_id))
             conn.commit()
         except sqlite3.Error as exc:
             conn.rollback()

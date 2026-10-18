@@ -52,6 +52,12 @@ def scan_once(vault: Vault, auth_file: Path, log: Log = print) -> Dict[str, obje
         log("已更新账号 %s 的登录态快照" % state.uid[:8])
         return {"event": "refreshed", "uid": state.uid}
 
+    # 登录态没变，但 App 可能刚写完账号档案（含邮箱），补一下
+    email = vault.refresh_email(state.uid)
+    if email:
+        log("已记录账号 %s 的邮箱 %s" % (state.uid[:8], email))
+        return {"event": "profile", "uid": state.uid, "email": email}
+
     return {"event": "idle", "uid": state.uid}
 
 

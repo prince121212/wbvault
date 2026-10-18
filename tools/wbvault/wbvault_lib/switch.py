@@ -39,6 +39,13 @@ EXIT_USAGE = 2
 EXIT_PENDING = 3
 
 
+def _label(entry, fallback: str) -> str:
+    """账号的人话名字：别名 > 邮箱 > uid 前 8 位。"""
+    if not entry:
+        return fallback
+    return str(entry.get("alias") or entry.get("email") or fallback)
+
+
 @dataclass
 class SwitchResult:
     status: str  # ok | noop | pending | rolled_back | refused | error
@@ -173,12 +180,12 @@ def switch(
     if dry_run:
         if same_account:
             message = "[dry-run] 当前已是 %s（%s），不会执行写入" % (
-                entry.get("alias") or target.uid_short,
+                _label(entry, target.uid_short),
                 target.uid[:8],
             )
         else:
             message = "[dry-run] 将切换到 %s（%s），当前 %s" % (
-                entry.get("alias") or target.uid_short,
+                _label(entry, target.uid_short),
                 target.uid[:8],
                 current.uid[:8],
             )
@@ -195,7 +202,7 @@ def switch(
         vault.snapshot(current)
         return SwitchResult(
             "noop",
-            "当前已经是这个账号（%s），无需切换" % (entry.get("alias") or current.uid_short),
+            "当前已经是这个账号（%s），无需切换" % (_label(entry, current.uid_short)),
             EXIT_OK,
             target_uid=target.uid,
             previous_uid=current.uid,
@@ -222,7 +229,7 @@ def switch(
     # ---------- 写入 ----------
     try:
         atomic_write(auth_file, target.raw, mode=0o600)
-        log("已原子替换为 %s（%s）" % (entry.get("alias") or target.uid_short, target.uid[:8]))
+        log("已原子替换为 %s（%s）" % (_label(entry, target.uid_short), target.uid[:8]))
     except OSError as exc:
         return SwitchResult("error", "写入失败，未改动登录态：%s" % exc, EXIT_FAILED,
                             target_uid=target.uid, previous_uid=current.uid, backup=backup)
@@ -305,7 +312,7 @@ def switch(
     return SwitchResult(
         "ok",
         "已切换到 %s（%s），校验通过（%s）"
-        % (entry.get("alias") or target.uid_short, target.uid[:8], verified_by),
+        % (_label(entry, target.uid_short), target.uid[:8], verified_by),
         EXIT_OK,
         target_uid=target.uid,
         previous_uid=current.uid,

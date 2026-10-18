@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import shutil
@@ -15,6 +16,30 @@ from pathlib import Path
 from typing import Tuple
 
 LABEL = "ai.workbuddy.wbvault.watch"
+STAMP_NAME = ".stamp"
+
+
+def source_stamp(source_dir: Path) -> str:
+    """给一份 wbvault 源码打指纹（只算 .py，忽略 __pycache__ 和 tests）。"""
+    digest = hashlib.sha1()
+    for path in sorted(source_dir.rglob("*.py")):
+        if "__pycache__" in path.parts or "tests" in path.parts:
+            continue
+        digest.update(path.relative_to(source_dir).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def runtime_stamp(runtime: Path) -> str:
+    try:
+        return (runtime / STAMP_NAME).read_text("utf-8").strip()
+    except OSError:
+        return ""
 
 
 def stage_runtime(source_script: Path, vault_root: Path) -> Path:
@@ -23,17 +48,39 @@ def stage_runtime(source_script: Path, vault_root: Path) -> Path:
     launchd 往往无法执行外接卷上的脚本（bootstrap 会报 Input/output error），
     复制到 ~/Library/Application Support 下可以避免这个问题，
     也让常驻进程不依赖开发目录是否挂载。
+
+    副本旁边写一个 .stamp（源码指纹），用来判断副本是不是过期了 ——
+    菜单栏 App 调的是副本，副本过期就会报 unrecognized arguments 这类错。
     """
     source_dir = source_script.parent
     runtime = vault_root / "runtime"
+    stamp = source_stamp(source_dir)
     if runtime.exists():
         shutil.rmtree(runtime)
     shutil.copytree(
         source_dir,
         runtime,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests", ".git"),
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests", ".git", STAMP_NAME),
     )
+    try:
+        (runtime / STAMP_NAME).write_text(stamp + "\n", "utf-8")
+    except OSError:
+        pass
     return runtime / source_script.name
+
+
+def sync_runtime(source_script: Path, vault_root: Path) -> bool:
+    """源码比运行时副本新就刷新副本，返回是否刷新过。
+
+    只在副本已存在时动手（没安装过就不越界铺文件）。
+    """
+    runtime = vault_root / "runtime"
+    if not (runtime / source_script.name).is_file():
+        return False
+    if source_stamp(source_script.parent) == runtime_stamp(runtime):
+        return False
+    stage_runtime(source_script, vault_root)
+    return True
 
 
 def plist_path() -> Path:

@@ -95,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("selector")
     al.add_argument("name")
 
+    em = sub.add_parser("email", help="给账号记一个邮箱（默认从本机账号档案自动采集）")
+    em.add_argument("selector")
+    em.add_argument("email", help="邮箱地址；传空字符串则清除")
+
     rm = sub.add_parser("remove", help="从账号库删除某个账号快照")
     rm.add_argument("selector")
     rm.add_argument("--yes", action="store_true", help="跳过确认")
@@ -145,6 +149,7 @@ def cmd_current(vault: Vault, auth_file: Path, as_json: bool) -> int:
         "uid": state.uid,
         "uin": state.uin,
         "alias": (entry or {}).get("alias", ""),
+        "email": (entry or {}).get("email", ""),
         "domain": state.domain,
         "accountType": state.account_type,
         "expiresAt": state.expires_at,
@@ -161,6 +166,7 @@ def cmd_current(vault: Vault, auth_file: Path, as_json: bool) -> int:
 
     print(fmt.paint("当前账号", fmt.BOLD))
     print("  别名      %s" % (entry.get("alias") or fmt.paint("(未命名)", fmt.DIM)))
+    print("  邮箱      %s" % ((entry or {}).get("email") or fmt.paint("(未采集，切到该账号一次即自动记录)", fmt.DIM)))
     print("  uid       %s" % state.uid)
     print("  uin       %s" % (state.uin or "-"))
     print("  环境      %s" % (state.domain or "-"))
@@ -198,16 +204,16 @@ def cmd_list(vault: Vault, auth_file: Path, as_json: bool) -> int:
             [
                 marker,
                 entry.get("alias") or "-",
+                entry.get("email") or "-",
                 fmt.short_uid(uid),
-                fmt.mask_uin(entry.get("uin", "")),
                 entry.get("domain") or "-",
                 fmt.ago(int(entry.get("lastSeenActiveAt") or 0)),
                 fmt.in_days(int(entry.get("refreshExpiresAt") or 0)),
                 "正常" if ok else "快照损坏",
             ]
         )
-    print(fmt.table(["", "别名", "uid", "uin", "环境", "上次在线", "剩余", "快照"], rows))
-    print(fmt.paint("\n* 为当前登录账号；切换：wbvault switch <别名|uid|uin>", fmt.DIM))
+    print(fmt.table(["", "别名", "邮箱", "uid", "环境", "上次在线", "剩余", "快照"], rows))
+    print(fmt.paint("\n* 为当前登录账号；切换：wbvault switch <别名|邮箱|uid|uin>", fmt.DIM))
     return EXIT_OK
 
 
@@ -231,6 +237,7 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         if not args.json:
             print(fmt.paint("  · %s" % message, fmt.DIM))
 
+    carried = None
     # 先过继当前会话，再切登录态：切过去就能接着干
     if getattr(args, "with_current", False):
         entry = vault.find(args.selector)
@@ -242,6 +249,7 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
                 str(entry["uid"]),
                 dry_run=args.dry_run,
             )
+            carried = moved.to_dict()
             if not args.json:
                 print(
                     fmt.paint(
@@ -249,8 +257,12 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
                         fmt.DIM if moved.status == "ok" else fmt.YELLOW,
                     )
                 )
-            if moved.status != "ok" and not args.force:
-                return EXIT_FAILED if moved.status == "error" else EXIT_USAGE
+            # 写库失败时别硬切：会话留在旧账号，用户会以为会话丢了
+            if moved.status == "error" and not args.force:
+                return EXIT_FAILED
+            # 「已属于目标账号 / 云端会话」不算失败，照常切换登录态
+            if moved.status == "refused" and not args.json:
+                print(fmt.paint("  · 继续切换登录态（会话未过继）", fmt.YELLOW))
 
     result = switch(
         vault,
@@ -263,7 +275,10 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         log=log,
     )
     if args.json:
-        print_json(result.to_dict())
+        payload = result.to_dict()
+        if carried is not None:
+            payload["handover"] = carried
+        print_json(payload)
     else:
         color = {
             "ok": fmt.GREEN,
@@ -305,6 +320,18 @@ def cmd_alias(vault: Vault, args) -> int:
         print_json({"ok": True, "account": entry})
     else:
         print("已把 %s 命名为「%s」" % (fmt.short_uid(str(entry["uid"])), entry["alias"]))
+    return EXIT_OK
+
+
+def cmd_email(vault: Vault, args) -> int:
+    entry = vault.set_email(args.selector, args.email)
+    if args.json:
+        print_json({"ok": True, "account": entry})
+    else:
+        if entry.get("email"):
+            print("已记录 %s 的邮箱：%s" % (entry.get("alias") or fmt.short_uid(str(entry["uid"])), entry["email"]))
+        else:
+            print("已清除 %s 的邮箱" % (entry.get("alias") or fmt.short_uid(str(entry["uid"]))))
     return EXIT_OK
 
 
@@ -520,6 +547,19 @@ def cmd_doctor(vault: Vault, auth_file: Path, as_json: bool) -> int:
     agent_state = agent_mod.status()
     add("常驻监听", "已加载" in agent_state, agent_state, critical=False)
 
+    runtime = vault.root / "runtime"
+    source_dir = Path(__file__).resolve().parent
+    if (runtime / "wbvault.py").is_file():
+        same = agent_mod.source_stamp(source_dir) == agent_mod.runtime_stamp(runtime)
+        add(
+            "运行时副本同步",
+            same,
+            "与源码一致" if same else "副本过期（菜单栏会调到旧代码，运行 wbvault install 或任意命令即可刷新）",
+            critical=False,
+        )
+    else:
+        add("运行时副本同步", False, "未安装运行时副本（菜单栏 App 需要它）", critical=False)
+
     if as_json:
         print_json({"ok": all(c["ok"] or not c["critical"] for c in checks), "checks": checks})
         return EXIT_OK if all(c["ok"] or not c["critical"] for c in checks) else EXIT_FAILED
@@ -565,6 +605,17 @@ def main(argv=None) -> int:
         print(fmt.paint(str(exc), fmt.RED))
         return EXIT_USAGE
 
+    # 菜单栏 App 调用的是 ~/Library/.../runtime 里的副本；源码改过而副本没跟上时，
+    # App 会拿着新参数去调旧代码（典型报错：unrecognized arguments）。
+    # 这里在源码副本运行时顺手刷新一次，让副本永远跟源码一致。
+    script = Path(__file__).resolve()
+    try:
+        if script.parent != (vault.root / "runtime").resolve():
+            if agent_mod.sync_runtime(script, vault.root) and not args.json and args.command != "watch":
+                print(fmt.paint("提示：已刷新菜单栏运行时副本 %s" % (vault.root / "runtime"), fmt.DIM))
+    except OSError:
+        pass
+
     handlers = {
         "current": lambda: cmd_current(vault, auth_file, args.json),
         "list": lambda: cmd_list(vault, auth_file, args.json),
@@ -572,6 +623,7 @@ def main(argv=None) -> int:
         "switch": lambda: cmd_switch(vault, auth_file, args),
         "restore": lambda: cmd_restore(vault, auth_file, args),
         "alias": lambda: cmd_alias(vault, args),
+        "email": lambda: cmd_email(vault, args),
         "remove": lambda: cmd_remove(vault, args),
         "watch": lambda: cmd_watch(vault, auth_file, args),
         "prune": lambda: cmd_prune(vault, args),

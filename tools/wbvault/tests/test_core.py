@@ -230,6 +230,54 @@ class TestSwitch(BaseCase):
         self.assertEqual(read_state(self.auth_file).uid, UID_A)
 
 
+class TestEmail(BaseCase):
+    def test_set_and_find_by_email(self) -> None:
+        self.vault.snapshot(read_state(self.auth_file))
+        self.vault.set_email("aaaa", "someone@gmail.com")
+        self.assertEqual(self.vault.find("someone@gmail.com")["uid"], UID_A)
+        self.assertEqual(self.vault.find("SOMEONE@gmail.com")["uid"], UID_A)
+
+    def test_clear_email(self) -> None:
+        self.vault.snapshot(read_state(self.auth_file))
+        self.vault.set_email(UID_A, "someone@gmail.com")
+        self.vault.set_email(UID_A, "")
+        self.assertNotIn("email", self.vault.find(UID_A))
+
+
+class TestProfile(BaseCase):
+    def _write_profile(self, uid: str, nickname: str) -> None:
+        path = self.tmp / ".workbuddy-ai" / "storage" / "skeleton"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "account-snapshot.json").write_text(
+            json.dumps({"primary": {"uid": uid, "nickname": nickname}}), "utf-8"
+        )
+
+    def test_nickname_for_matching_uid(self) -> None:
+        import wbvault_lib.profile as pf
+
+        self._write_profile(UID_A, "someone@gmail.com")
+        with mock.patch.object(pf.Path, "home", return_value=self.tmp):
+            self.assertEqual(pf.nickname_for(UID_A), "someone@gmail.com")
+            self.assertIsNone(pf.nickname_for(UID_B))
+
+    def test_nickname_without_at_is_ignored(self) -> None:
+        import wbvault_lib.profile as pf
+
+        self._write_profile(UID_A, "阿黄")
+        with mock.patch.object(pf.Path, "home", return_value=self.tmp):
+            self.assertIsNone(pf.nickname_for(UID_A))
+
+    def test_refresh_email_only_when_changed(self) -> None:
+        import wbvault_lib.profile as pf
+
+        self.vault.snapshot(read_state(self.auth_file))
+        self._write_profile(UID_A, "someone@gmail.com")
+        with mock.patch.object(pf.Path, "home", return_value=self.tmp):
+            self.assertEqual(self.vault.refresh_email(UID_A), "someone@gmail.com")
+            self.assertIsNone(self.vault.refresh_email(UID_A))
+        self.assertEqual(self.vault.find(UID_A)["email"], "someone@gmail.com")
+
+
 class TestAtomicWrite(BaseCase):
     def test_permissions_and_content(self) -> None:
         data = make_auth(UID_B, "2")
@@ -317,3 +365,49 @@ class TestHandover(BaseCase):
         conn = sqlite3.connect(str(db))
         self.assertEqual(conn.execute("select user_id from sessions").fetchone()[0], UID_A)
         conn.close()
+
+    def test_current_session_id_strips_query(self) -> None:
+        """startup-route 里是 /conversation/<id>?startIntentToken=6，问号后不能算进 id。"""
+        import wbvault_lib.handover as ho
+
+        route_dir = self.tmp / ".workbuddy-ai" / UID_A
+        route_dir.mkdir(parents=True)
+        (route_dir / "startup-route.json").write_text(
+            json.dumps({"path": "/conversation/abc-123?startIntentToken=6"}), "utf-8"
+        )
+        with mock.patch.object(ho.Path, "home", return_value=self.tmp):
+            self.assertEqual(ho.current_session_id(UID_A), "abc-123")
+
+    def test_resolve_session_accepts_route_fragment(self) -> None:
+        import sqlite3
+
+        import wbvault_lib.handover as ho
+
+        db = self._make_db()
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        row = ho.resolve_session(conn, "conversation/sess-0001?x=1", UID_A)
+        self.assertEqual(row["id"], "sess-0001")
+        conn.close()
+
+    def test_handover_bumps_last_activity(self) -> None:
+        import sqlite3
+
+        import wbvault_lib.handover as ho
+
+        db = self._make_db()
+        started = int(time.time() * 1000)
+        result = ho.handover(self.vault, db, "sess", UID_B)
+        self.assertEqual(result.status, "ok", result.message)
+        conn = sqlite3.connect(str(db))
+        stamp = conn.execute("select last_activity_at from sessions").fetchone()[0]
+        conn.close()
+        self.assertGreaterEqual(stamp, started)
+
+    def test_missing_session_returns_error_not_traceback(self) -> None:
+        import wbvault_lib.handover as ho
+
+        db = self._make_db()
+        result = ho.handover(self.vault, db, "不存在的会话", UID_B)
+        self.assertEqual(result.status, "error")
+        self.assertIn("找不到会话", result.message)

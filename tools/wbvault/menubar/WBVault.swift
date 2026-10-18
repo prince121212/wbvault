@@ -14,6 +14,10 @@ let authFile = home.appendingPathComponent(
 let watchLog = home.appendingPathComponent("Library/Logs/wbvault-watch.log")
 let loginItemLabel = "ai.workbuddy.wbvault.app"
 let loginItemPath = home.appendingPathComponent("Library/LaunchAgents/\(loginItemLabel).plist")
+// App 自带一份 wbvault 源码（build.sh 打进 Resources/runtime-src），
+// 启动时用它校准运行时副本，避免「App 传新参数、副本还是旧代码」。
+let runtimeDir = vaultRoot.appendingPathComponent("runtime")
+let bundledRuntime = Bundle.main.resourceURL?.appendingPathComponent("runtime-src")
 
 // MARK: - 基础工具
 
@@ -43,18 +47,63 @@ func runPython(_ args: [String]) -> (Int32, String) {
     shell("/usr/bin/python3", [runtimeScript.path] + args)
 }
 
+// MARK: - 运行时同步
+
+func readStamp(_ dir: URL?) -> String {
+    guard let dir,
+          let text = try? String(contentsOf: dir.appendingPathComponent(".stamp"), encoding: .utf8) else {
+        return ""
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// 副本指纹和 App 自带源码不一致时整份覆盖。返回是否刷新过。
+@discardableResult
+func syncBundledRuntime() -> Bool {
+    guard let src = bundledRuntime,
+          FileManager.default.fileExists(atPath: src.appendingPathComponent("wbvault.py").path) else {
+        return false
+    }
+    let stamp = readStamp(src)
+    if !stamp.isEmpty, stamp == readStamp(runtimeDir) { return false }
+    do {
+        if FileManager.default.fileExists(atPath: runtimeDir.path) {
+            try FileManager.default.removeItem(at: runtimeDir)
+        }
+        try FileManager.default.createDirectory(at: vaultRoot, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: src, to: runtimeDir)
+        return true
+    } catch {
+        return false
+    }
+}
+
 // MARK: - 数据
 
 struct Account {
     let uid: String
     let alias: String
+    let email: String
     let uin: String
     let domain: String
     let daysLeft: Int?
     let lastSeen: Int
 
     var shortUid: String { String(uid.prefix(8)) }
-    var displayName: String { alias.isEmpty ? shortUid : alias }
+    /// 邮箱最好认；没有邮箱就退回别名，再退 uid 前 8 位。
+    var displayName: String {
+        if !email.isEmpty { return email }
+        return alias.isEmpty ? shortUid : alias
+    }
+
+    /// 菜单里的一行：别名 · 邮箱（没邮箱就补 uid）· 剩余天数，不重复展示同一个标识。
+    var menuTitle: String {
+        var parts: [String] = []
+        if !alias.isEmpty, alias.lowercased() != shortUid { parts.append(alias) }
+        parts.append(email.isEmpty ? shortUid : email)
+        if let days = daysLeft { parts.append("剩 \(days) 天") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 func loadActiveUid() -> String? {
@@ -75,6 +124,7 @@ func loadAccounts() -> [Account] {
         return Account(
             uid: uid,
             alias: item["alias"] as? String ?? "",
+            email: item["email"] as? String ?? "",
             uin: item["uin"] as? String ?? "",
             domain: item["domain"] as? String ?? "",
             daysLeft: days,
@@ -145,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var startedWatcher = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        syncBundledRuntime()
         startWatcherIfNeeded()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -227,10 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             for account in accounts {
                 let mark = account.uid == activeUid ? "● " : "○ "
-                let name = account.alias.isEmpty ? account.shortUid : account.alias
-                var title = "\(mark)\(name)  ·  \(account.shortUid)"
-                if let days = account.daysLeft { title += "  ·  剩 \(days) 天" }
-                let item = NSMenuItem(title: title, action: #selector(switchAccount(_:)), keyEquivalent: "")
+                let item = NSMenuItem(title: mark + account.menuTitle, action: #selector(switchAccount(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = account.uid
                 item.state = account.uid == activeUid ? .on : .off
@@ -245,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let carryMenu = NSMenu()
         for account in accounts where account.uid != activeUid {
             let item = NSMenuItem(
-                title: "\(account.displayName)（\(account.shortUid)）",
+                title: account.menuTitle,
                 action: #selector(switchWithCurrent(_:)),
                 keyEquivalent: ""
             )
@@ -366,11 +414,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// argparse 失败时会先打一大段 usage，真正有用的只有最后那行 error。
+    func tidyError(_ text: String) -> String {
+        let lines = text
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if let index = lines.lastIndex(where: { $0.contains("error:") }) {
+            return lines[index...].joined(separator: "\n")
+        }
+        return lines.suffix(10).joined(separator: "\n")
+    }
+
     func showError(_ message: String, code: Int32) {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "操作没有完成（退出码 \(code)）"
-        alert.informativeText = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = tidyError(message)
+        alert.informativeText = detail.isEmpty ? "没有更多信息，可查看监听日志" : detail
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -389,6 +450,15 @@ if arguments.contains("--status") {
     print("watcher: \(isWatcherRunning() ? "running" : "stopped")")
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")
+    exit(0)
+}
+if arguments.contains("--menu") {
+    // 只是把菜单会显示的文字打出来，方便核对显示逻辑
+    let activeUid = loadActiveUid()
+    for account in loadAccounts() {
+        let mark = account.uid == activeUid ? "● " : "○ "
+        print(mark + account.menuTitle)
+    }
     exit(0)
 }
 if arguments.contains("--install-login-item") {
