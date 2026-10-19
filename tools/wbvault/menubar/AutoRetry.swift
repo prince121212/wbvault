@@ -201,6 +201,14 @@ final class AutoRetry {
         let root = AXUIElementCreateApplication(app.processIdentifier)
         enableAccessibility(root)
 
+        // 先判「额度耗尽」：这种提示没有「重试」按钮（按钮是「消耗积分…/切换 Auto」），
+        // 按下去只会再被拒一次。它和「模型忙，稍后重试」是两回事，处理动作也不同：
+        // 前者换号，后者重试。所以必须在按重试之前先排除掉。
+        if let matched = findQuotaToast(in: root) {
+            Rollover.shared.handleQuotaToast(matchedText: matched)
+            return
+        }
+
         guard let hit = findRetry(in: root, allowWeak: gateOpen) else { return }
 
         let now = Date()
@@ -280,6 +288,102 @@ final class AutoRetry {
         return nil
     }
 
+    /// 「额度耗尽」提示：返回命中的原文（写日志用，方便核对关键词是否猜对）。
+    ///
+    /// 和「模型忙」的区别在按钮上——前者是「消耗积分继续使用该模型 / 切换 Auto」，
+    /// 后者是「重试 / 换模型」。文案也可能出现「频率限制」「重置后使用」这类字样。
+    ///
+    /// **必须命中一个可按的按钮才算数**，光有文字不行。
+    /// 踩过的坑：只看文字时，聊天正文里讨论「切换 Auto / 消耗积分」这句话
+    /// 本身就含这些词，于是被当成提示，白切了三次号。文字在聊天里到处都是，
+    /// 按钮不会——所以把「能按」当成必要条件。
+    private func findQuotaToast(in root: AXUIElement) -> String? {
+        let buttonPhrases = ["消耗积分", "切换 Auto", "切换至其他模型"]
+        let textPhrases = ["频率限制", "已超出", "重置后使用", "免费使用量", "额度已用尽", "额度已用完"]
+        var queue: [(AXUIElement, Int)] = windows(root).map { ($0, 0) }
+        var index = 0
+        var visited = 0
+        var button: String?
+        var text: String?
+        let deadline = Date().addingTimeInterval(timeBudget)
+
+        while index < queue.count, visited < nodeBudget {
+            if visited % 150 == 0, Date() > deadline { break }
+            let (element, depth) = queue[index]
+            index += 1
+            visited += 1
+
+            let label = [
+                string(element, kAXTitleAttribute),
+                string(element, kAXDescriptionAttribute),
+                string(element, kAXValueAttribute),
+            ].joined(separator: " ")
+            if label.isEmpty {
+                if depth < 60 { for child in children(element) { queue.append((child, depth + 1)) } }
+                continue
+            }
+            if canPress(element) {
+                if button == nil, label.count <= 60,
+                   buttonPhrases.first(where: { label.contains($0) }) != nil {
+                    button = label.trimmingCharacters(in: .whitespaces)
+                }
+            } else if text == nil, textPhrases.first(where: { label.contains($0) }) != nil {
+                text = String(label.prefix(80))
+            }
+
+            if depth < 60 {
+                for child in children(element) {
+                    queue.append((child, depth + 1))
+                }
+            }
+        }
+
+        guard let matched = button else { return nil }
+        if let text { return "按钮「\(matched)」＋文案「\(text)」" }
+        return "按钮「\(matched)」（没读到提示文案，仅凭按钮判定）"
+    }
+
+    /// 给 --ax-quota 用：把按钮候选和文案候选分开列出来，方便核对到底命中了什么。
+    func quotaDiagnostics() -> [String] {
+        let buttonPhrases = ["消耗积分", "切换 Auto", "切换至其他模型"]
+        let textPhrases = ["频率限制", "已超出", "重置后使用", "免费使用量", "额度已用尽", "额度已用完"]
+        var lines: [String] = []
+        guard let app = NSRunningApplication
+            .runningApplications(withBundleIdentifier: workbuddyBundleID).first else {
+            return ["app: 没在运行"]
+        }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        enableAccessibility(root)
+
+        var queue: [(AXUIElement, Int)] = windows(root).map { ($0, 0) }
+        var index = 0
+        var visited = 0
+        var buttons: [String] = []
+        var texts: [String] = []
+        while index < queue.count, visited < 4000 {
+            let (element, depth) = queue[index]
+            index += 1
+            visited += 1
+            let label = [
+                string(element, kAXTitleAttribute),
+                string(element, kAXDescriptionAttribute),
+                string(element, kAXValueAttribute),
+            ].joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            if !label.isEmpty {
+                if canPress(element) {
+                    if buttonPhrases.first(where: { label.contains($0) }) != nil { buttons.append(label) }
+                } else if textPhrases.first(where: { label.contains($0) }) != nil {
+                    texts.append(String(label.prefix(60)))
+                }
+            }
+            if depth < 60 { for child in children(element) { queue.append((child, depth + 1)) } }
+        }
+        lines.append("可按按钮命中(\(buttons.count)): \(buttons.prefix(5).joined(separator: " | "))")
+        lines.append("静态文案命中(\(texts.count)): \(texts.prefix(5).joined(separator: " | "))")
+        lines.append("结论: \(findQuotaToast(in: root) ?? "不触发切号（没找到额度按钮）")")
+        return lines
+    }
+
     private func windows(_ root: AXUIElement) -> [AXUIElement] {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(root, kAXWindowsAttribute as CFString, &value) == .success,
@@ -353,6 +457,15 @@ final class AutoRetry {
         }
         lines.append("节点数: \(visited)")
         return lines
+    }
+
+    /// 给 --ax-quota 用：页面上有额度提示时立刻能看到命中的原文，用来核对关键词。
+    func quotaToastText() -> String? {
+        guard let app = NSRunningApplication
+            .runningApplications(withBundleIdentifier: workbuddyBundleID).first else { return nil }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        enableAccessibility(root)
+        return findQuotaToast(in: root)
     }
 
     /// 给 --ax-test 用：确认权限、能不能读到页面、有没有「重试」按钮。

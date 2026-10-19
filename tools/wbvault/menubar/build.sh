@@ -22,7 +22,7 @@ swiftc -O -swift-version 5 \
   -target arm64-apple-macos13.0 \
   -framework AppKit \
   -framework ApplicationServices \
-  -o "$BIN" "$HERE/main.swift" "$HERE/AutoRetry.swift"
+  -o "$BIN" "$HERE/main.swift" "$HERE/AutoRetry.swift" "$HERE/Rollover.swift"
 
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 

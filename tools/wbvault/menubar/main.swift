@@ -378,6 +378,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.isEnabled = !retry.trusted
             menu.addItem(sub)
         }
+
+        // 额度耗尽自动切下一个号（和上面「自动重试」是两件事：按钮样式不同）
+        let rollover = Rollover.shared
+        let roItem = menuItem(
+            rollover.enabled ? "额度耗尽自动切号：开" : "额度耗尽自动切号：关",
+            #selector(toggleRollover)
+        )
+        roItem.state = rollover.enabled ? .on : .off
+        menu.addItem(roItem)
+        if rollover.enabled {
+            let total = loadAccounts().count
+            let detail = total < 2
+                ? "库里只有 \(total) 个号，切不了"
+                : rollover.lastMessage.isEmpty
+                    ? "待命 · 共 \(total) 个号"
+                    : "\(rollover.lastMessage) · 共 \(total) 个号"
+            let sub = NSMenuItem(title: "  " + detail, action: nil, keyEquivalent: "")
+            sub.isEnabled = false
+            menu.addItem(sub)
+        }
         menu.addItem(.separator())
 
         let autoStart = menuItem(loginItemInstalled() ? "开机自启：已开启" : "开机自启：关闭", #selector(toggleLoginItem))
@@ -430,6 +450,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         retry.enabled.toggle()
         if retry.enabled, !retry.trusted {
             showPermissionAlert()
+        }
+        refreshMenu()
+    }
+
+    @objc func toggleRollover() {
+        let rollover = Rollover.shared
+        rollover.enabled.toggle()
+        if rollover.enabled {
+            showInfo(
+                "开启后：遇到「已超出频率限制，可在 … 重置后使用」这种提示（按钮是"
+                + "「消耗积分继续使用该模型 / 切换 Auto」），会自动切到库里的下一个号。\n\n"
+                + "「模型忙，请稍后重试」那种不切号，还是按「重试」——那两件事按钮不一样。",
+                title: "额度耗尽自动切号"
+            )
         }
         refreshMenu()
     }
@@ -597,6 +631,13 @@ if arguments.contains("--status") {
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")
     print("autoRetry: \(AutoRetry.shared.enabled ? "on" : "off")")
+    print("autoRollover: \(Rollover.shared.enabled ? "on" : "off")")
+    if !Rollover.shared.lastMessage.isEmpty { print("rollover: \(Rollover.shared.lastMessage)") }
+    exit(0)
+}
+if arguments.contains("--ax-quota") {
+    // 额度提示在屏幕上时跑一次：按钮候选和文案候选分开列，看清楚到底凭什么触发
+    for line in AutoRetry.shared.quotaDiagnostics() { print(line) }
     exit(0)
 }
 if arguments.contains("--ax-trusted") {
