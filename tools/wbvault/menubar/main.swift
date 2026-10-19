@@ -133,6 +133,28 @@ func loadAccounts() -> [Account] {
     }
 }
 
+// MARK: - 版本
+
+/// 构建时写进 Resources/build-info.txt（commit / built / 运行时源码指纹）。
+/// 用来回答「我这份是不是最新的」——App 不会自己热更新，版本号是唯一的凭证。
+func buildInfo() -> [String: String] {
+    guard let url = Bundle.main.resourceURL?.appendingPathComponent("build-info.txt"),
+          let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+    var dict: [String: String] = [:]
+    for line in text.split(separator: "\n") {
+        let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+        if parts.count == 2 { dict[parts[0]] = parts[1] }
+    }
+    return dict
+}
+
+func buildLabel() -> String {
+    let info = buildInfo()
+    let commit = info["commit"] ?? "unknown"
+    let built = info["built"] ?? "unknown"
+    return "\(commit) @ \(built)"
+}
+
 // MARK: - 监听进程
 
 func watcherPids() -> [String] {
@@ -361,6 +383,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(menuItem("打开账号库", #selector(openVault)))
         menu.addItem(menuItem("查看监听日志", #selector(openLog)))
         menu.addItem(.separator())
+        let version = NSMenuItem(title: "版本 \(buildLabel())", action: nil, keyEquivalent: "")
+        version.isEnabled = false
+        menu.addItem(version)
         menu.addItem(menuItem("退出", #selector(quit)))
     }
 
@@ -563,6 +588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let arguments = CommandLine.arguments
 if arguments.contains("--status") {
     print("app: \(Bundle.main.bundlePath)")
+    print("version: \(buildLabel())")
     print("watcher: \(isWatcherRunning() ? "running" : "stopped")")
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")

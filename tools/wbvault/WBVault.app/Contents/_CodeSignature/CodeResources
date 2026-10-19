@@ -4,6 +4,10 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/build-info.txt</key>
+		<data>
+		fmi3wh0kIMkXjHMKpVVQn75OZhk=
+		</data>
 		<key>Resources/runtime-src/.stamp</key>
 		<data>
 		u/JCxgjHPPWxBmHpEAIn+gx9Py4=
@@ -55,6 +59,13 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Resources/build-info.txt</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			IGGs/SAFLQ5m7n1Vd+/lV4BbEFvIg61pyVd2EhXGHRo=
+			</data>
+		</dict>
 		<key>Resources/runtime-src/.stamp</key>
 		<dict>
 			<key>hash2</key>

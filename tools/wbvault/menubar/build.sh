@@ -48,6 +48,15 @@ PY
 )"
 printf '%s\n' "$STAMP" > "$RES/runtime-src/.stamp"
 
+# 版本戳：让用户能核对「我手上这份是不是最新的」。
+# 取 git 短 hash；工作区有未提交改动就加 -dirty，避免拿脏树冒充发布版。
+COMMIT="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if ! git -C "$SRC" diff --quiet -- . 2>/dev/null; then
+  COMMIT="${COMMIT}-dirty"
+fi
+BUILT="$(date '+%Y-%m-%d %H:%M')"
+printf 'commit=%s\nbuilt=%s\nstamp=%s\n' "$COMMIT" "$BUILT" "$STAMP" > "$RES/build-info.txt"
+
 chmod +x "$BIN"
 # 自签名（ad-hoc）+ 固定的「设计要求」。
 #

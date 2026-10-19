@@ -107,6 +107,42 @@ python3 wbvault.py --json handovers --undo
 - 从仓库直接跑 `python3 wbvault.py <任意命令>` 时也会顺手校准副本；
 - `doctor` 里的「运行时副本同步」一项可以确认两者一致。
 
+## 更新到最新版
+
+仓库里**提交了编译好的 `WBVault.app`**（二进制 + 内置源码 + 签名），所以 clone 下来双击就能用，不需要装 Xcode。但 App 不会自己热更新，更新要手动三步：
+
+```bash
+# 1. 先退出菜单栏 App（点图标 → 退出），别让它边跑边被覆盖
+# 2. 拉最新代码
+git pull
+# 3. 重新打开
+open tools/wbvault/WBVault.app
+```
+
+为什么要退出再开：运行中的进程用的是已经加载进内存的旧二进制；Python 那部分（内置的 `runtime-src`）也只在 App 启动时才校准到 `~/Library/Application Support/WorkBuddyAccountVault/runtime/`。
+
+**核对是不是最新**：菜单最下面一行「版本 `05883e3` @ 2026-10-19 16:19」，或
+
+```bash
+tools/wbvault/WBVault.app/Contents/MacOS/WBVault --status
+```
+
+带 `-dirty` 表示那次构建时工作区有未提交的改动，不是干净的发布版。
+
+**如果是下载 ZIP 而不是 clone**：解压出来的文件带 quarantine 标记，首次打开会被系统拦住（「无法验证开发者」或「已损坏」）。二选一：
+
+```bash
+xattr -dr com.apple.quarantine tools/wbvault/WBVault.app
+```
+
+或到「系统设置 → 隐私与安全性」底部点「仍要打开」。
+
+其他注意：
+
+- **辅助功能授权是每台机器各自的事**，不是跟着代码走的。自动重试要用，第一次得自己在设置里勾一下（见上一节）。授权记录现在认 bundle id，之后更新不会再掉。
+- 仓库里的二进制是 **arm64**（Apple Silicon）。Intel Mac 需要自己编译：改 `menubar/build.sh` 里的 `-target` 后执行它。
+- 系统要求 macOS 13+。
+
 ## 排错
 
 **「操作没有完成（退出码 2）… wbvault: error: unrecognized arguments: --with-current」**
