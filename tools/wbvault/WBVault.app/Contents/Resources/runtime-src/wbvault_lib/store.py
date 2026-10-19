@@ -227,3 +227,61 @@ class Vault:
                 entry["note"] = note
                 self.save()
                 return
+
+    # ---------- 设置与运行时状态 ----------
+
+    def settings(self) -> Dict[str, Any]:
+        """用户偏好。autoRestart 默认开：热重载失败时自动重启 App，不用手动点。"""
+        path = self.root / "settings.json"
+        if not path.is_file():
+            return {"autoRestart": True}
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"autoRestart": True}
+        if not isinstance(data, dict):
+            return {"autoRestart": True}
+        data.setdefault("autoRestart", True)
+        return data
+
+    def set_setting(self, key: str, value: Any) -> Dict[str, Any]:
+        data = self.settings()
+        data[key] = value
+        self.ensure()
+        atomic_write(
+            self.root / "settings.json",
+            json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"),
+            mode=0o600,
+        )
+        return data
+
+    def auto_restart(self) -> bool:
+        return bool(self.settings().get("autoRestart", True))
+
+    def reload_state(self) -> Dict[str, Any]:
+        """上一次切换时 App 的热重载结果（按 App 进程 pid 记）。"""
+        path = self.root / "reload-state.json"
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def record_reload(self, app_pid: Optional[int], healthy: bool, uid: str = "") -> None:
+        payload = {
+            "appPid": app_pid,
+            "healthy": healthy,
+            "uid": uid,
+            "at": int(time.time() * 1000),
+        }
+        try:
+            self.ensure()
+            atomic_write(
+                self.root / "reload-state.json",
+                json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
+                mode=0o600,
+            )
+        except OSError:
+            pass

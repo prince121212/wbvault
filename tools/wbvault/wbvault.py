@@ -39,7 +39,11 @@ from wbvault_lib.switch import (  # noqa: E402
     EXIT_OK,
     EXIT_PENDING,
     EXIT_USAGE,
+    SwitchResult,
     app_is_running,
+    app_pid,
+    probe_watcher_alive,
+    restart_app,
     restore_latest,
     switch,
 )
@@ -76,6 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="把当前打开的会话一起过继到目标账号，切过去可继续",
     )
+    sw.add_argument(
+        "--restart",
+        action="store_true",
+        help="热重载失败时重启 App（默认已开启，见 wbvault config）",
+    )
+    sw.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="热重载失败也不重启 App，只如实报告（退出码 3）",
+    )
     sw.add_argument("--db", help="会话数据库路径（默认 ~/.workbuddy-ai/workbuddy.db）")
 
     ho = sub.add_parser("handover", help="把某个会话过继到另一个账号（不切换登录态）")
@@ -90,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     rs = sub.add_parser("restore", help="用最近一次备份还原")
     rs.add_argument("--yes", action="store_true", help="跳过确认")
+
+    sub.add_parser("restart-app", help="重启 WorkBuddy AI，让写入的登录态生效（热重载失效时用）")
+
+    cfg = sub.add_parser("config", help="查看/修改设置（auto-restart on|off）")
+    cfg.add_argument("key", nargs="?", help="auto-restart")
+    cfg.add_argument("value", nargs="?", help="on / off")
 
     al = sub.add_parser("alias", help="给账号起别名")
     al.add_argument("selector")
@@ -108,7 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     wt.add_argument("--once", action="store_true", help="只检查一次")
     wt.add_argument("--seconds", type=float, default=None, help="运行指定秒数后退出")
 
-    sub.add_parser("doctor", help="自检：路径、权限、进程、账号库状态")
+    doc = sub.add_parser("doctor", help="自检：路径、权限、进程、账号库状态")
+    doc.add_argument("--probe", action="store_true", help="实测 App 的登录态监听是否还活着")
 
     se = sub.add_parser("sessions", help="只读查看各账号的会话与空间归属")
     se.add_argument("--all", action="store_true", help="列出每条会话")
@@ -272,8 +293,37 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         force=args.force,
         dry_run=args.dry_run,
         allow_domain_mismatch=args.allow_domain_mismatch,
+        auto_restart=False if args.no_restart else (True if args.restart else None),
         log=log,
     )
+
+    # 兼容老参数：--restart 已经内置到 switch 里了，这里只处理它没覆盖到的残留
+    if result.needs_restart and getattr(args, "restart", False):
+        if not args.json:
+            print(fmt.paint("  · App 没有热重载，正在重启…", fmt.YELLOW))
+        restarted = restart_app(log=log, expect_uid=result.target_uid)
+        if restarted.status == "ok":
+            result = SwitchResult(
+                "ok",
+                "已切换到 %s，并重启 App 使其生效" % result.target_uid[:8],
+                EXIT_OK,
+                target_uid=result.target_uid,
+                previous_uid=result.previous_uid,
+                backup=result.backup,
+                verified_by="restart",
+            )
+        else:
+            result = SwitchResult(
+                "error",
+                "%s。重启没成功：%s" % (result.message, restarted.message),
+                EXIT_FAILED,
+                target_uid=result.target_uid,
+                previous_uid=result.previous_uid,
+                backup=result.backup,
+                verified_by=result.verified_by,
+                needs_restart=True,
+            )
+
     if args.json:
         payload = result.to_dict()
         if carried is not None:
@@ -312,6 +362,52 @@ def cmd_restore(vault: Vault, auth_file: Path, args) -> int:
     else:
         print(fmt.paint(result.message, fmt.GREEN if result.status == "ok" else fmt.RED))
     return result.exit_code
+
+
+def cmd_restart_app(vault: Vault, auth_file: Path, args) -> int:
+    def log(message: str) -> None:
+        if not args.json:
+            print(fmt.paint("  · %s" % message, fmt.DIM))
+
+    try:
+        uid = read_state(auth_file).uid
+    except AuthFileError:
+        uid = ""
+    result = restart_app(log=log, expect_uid=uid)
+    if result.status == "ok" and uid:
+        vault.record_reload(app_pid(), True, uid)
+    if args.json:
+        print_json(result.to_dict())
+    else:
+        print(fmt.paint(result.message, fmt.GREEN if result.status == "ok" else fmt.RED))
+    return result.exit_code
+
+
+def cmd_config(vault: Vault, args) -> int:
+    """auto-restart on|off：热重载失败时要不要自动重启 App。"""
+    if not args.key:
+        data = vault.settings()
+        if args.json:
+            print_json({"ok": True, "settings": data})
+        else:
+            state = "开" if data.get("autoRestart", True) else "关"
+            print("自动重启 App：%s（热重载失败时）" % state)
+            print(fmt.paint("改：wbvault config auto-restart on|off", fmt.DIM))
+        return EXIT_OK
+
+    if args.key != "auto-restart":
+        print(fmt.paint("只支持 auto-restart，例如：wbvault config auto-restart off", fmt.YELLOW))
+        return EXIT_USAGE
+    if not args.value:
+        print(fmt.paint("要写成 wbvault config auto-restart on|off", fmt.YELLOW))
+        return EXIT_USAGE
+    flag = str(args.value).strip().lower() in ("on", "1", "true", "yes", "开")
+    data = vault.set_setting("autoRestart", flag)
+    if args.json:
+        print_json({"ok": True, "settings": data})
+    else:
+        print("自动重启 App：%s" % ("开" if flag else "关"))
+    return EXIT_OK
 
 
 def cmd_alias(vault: Vault, args) -> int:
@@ -504,7 +600,7 @@ def cmd_uninstall(args) -> int:
     return EXIT_OK if ok else EXIT_FAILED
 
 
-def cmd_doctor(vault: Vault, auth_file: Path, as_json: bool) -> int:
+def cmd_doctor(vault: Vault, auth_file: Path, as_json: bool, probe: bool = False) -> int:
     checks = []
 
     def add(name: str, ok: bool, detail: str, critical: bool = True) -> None:
@@ -527,6 +623,30 @@ def cmd_doctor(vault: Vault, auth_file: Path, as_json: bool) -> int:
 
     running = app_is_running()
     add("App 正在运行", running, "运行中" if running else "未运行（切换仍会写入，重启后生效）", critical=False)
+
+    # 热重载通道：App 靠目录监听发现外部改动，这个监听会静默失效
+    if probe and exists:
+        probe_state = probe_watcher_alive(auth_file)
+        detail = {
+            "alive": "刚探活：正常（App 收到了变更事件）",
+            "dead": "刚探活：已失效（下次切换会自动重启 App）",
+        }.get(probe_state, "刚探活：无法判断（找不到 App 日志）")
+        add("热重载通道", probe_state == "alive", detail, critical=False)
+    else:
+        last = vault.reload_state()
+        pid = app_pid()
+        if last.get("appPid") and pid and last.get("appPid") == pid:
+            healthy = last.get("healthy") is not False
+            add(
+                "热重载通道",
+                healthy,
+                "正常（上次切换热重载成功）" if healthy else "已失效（下次切换会自动重启 App）",
+                critical=False,
+            )
+        else:
+            add("热重载通道", True, "未测（本进程还没切过；doctor --probe 可实测）", critical=False)
+
+    add("热重载失败时自动重启", vault.auto_restart(), "开" if vault.auto_restart() else "关（wbvault config auto-restart on）", critical=False)
 
     obs_path = observation_for(auth_file)
     add("观测文件可用", bool(obs_path), str(obs_path or "未找到"), critical=False)
@@ -622,17 +742,20 @@ def main(argv=None) -> int:
         "snapshot": lambda: cmd_snapshot(vault, auth_file, args),
         "switch": lambda: cmd_switch(vault, auth_file, args),
         "restore": lambda: cmd_restore(vault, auth_file, args),
+        "restart-app": lambda: cmd_restart_app(args),
         "alias": lambda: cmd_alias(vault, args),
         "email": lambda: cmd_email(vault, args),
         "remove": lambda: cmd_remove(vault, args),
         "watch": lambda: cmd_watch(vault, auth_file, args),
         "prune": lambda: cmd_prune(vault, args),
-        "doctor": lambda: cmd_doctor(vault, auth_file, args.json),
+        "doctor": lambda: cmd_doctor(vault, auth_file, args.json, probe=getattr(args, "probe", False)),
         "sessions": lambda: cmd_sessions(vault, args),
         "handover": lambda: cmd_handover(vault, args),
         "handovers": lambda: cmd_handovers(vault, args),
         "install": lambda: cmd_install(args, vault),
         "uninstall": lambda: cmd_uninstall(args),
+        "restart-app": lambda: cmd_restart_app(vault, auth_file, args),
+        "config": lambda: cmd_config(vault, args),
     }
     try:
         return handlers[args.command]()

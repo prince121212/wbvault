@@ -144,7 +144,9 @@ class TestSwitch(BaseCase):
     def test_switch_success(self) -> None:
         self.vault.snapshot(read_state(self.auth_file), alias="A号")
         self.add_b_snapshot()
-        with mock.patch.object(sw, "app_is_running", return_value=True):
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "probe_app_reload", return_value="reloaded"
+        ):
             result = sw.switch(
                 self.vault,
                 self.auth_file,
@@ -157,6 +159,92 @@ class TestSwitch(BaseCase):
         self.assertEqual(read_state(self.auth_file).uid, UID_B)
         self.assertEqual(self.vault.active_uid(), UID_B)
         self.assertTrue(list_backups(self.vault.backups_dir))
+
+    def test_pending_when_app_did_not_reload(self) -> None:
+        """文件写对了、App 还活着但没热重载：必须报 pending，不能报成功。"""
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self.add_b_snapshot()
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "probe_app_reload", return_value="not_reloaded"
+        ):
+            result = sw.switch(
+                self.vault,
+                self.auth_file,
+                "B号",
+                verify_seconds=0.5,
+                settle_seconds=0.0,
+                auto_restart=False,
+                log=lambda _: None,
+            )
+        self.assertEqual(result.status, "pending", result.message)
+        self.assertTrue(result.needs_restart)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(read_state(self.auth_file).uid, UID_B)
+
+    def test_auto_restart_when_hot_reload_failed(self) -> None:
+        """默认自动重启：热重载失败时自己恢复，用户不用动手。"""
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self.add_b_snapshot()
+        fake = sw.SwitchResult("ok", "已重启", sw.EXIT_OK, verified_by="restart")
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "probe_app_reload", return_value="not_reloaded"
+        ), mock.patch.object(sw, "app_pid", return_value=999), mock.patch.object(
+            sw, "running_inside_app", return_value=False
+        ), mock.patch.object(sw, "restart_app", return_value=fake) as restarted:
+            result = sw.switch(
+                self.vault,
+                self.auth_file,
+                "B号",
+                verify_seconds=0.5,
+                settle_seconds=0.0,
+                log=lambda _: None,
+            )
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual(result.verified_by, "restart")
+        restarted.assert_called_once()
+
+    def test_no_auto_restart_inside_app(self) -> None:
+        """从 App 内部调用时不能自杀式重启。"""
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self.add_b_snapshot()
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "probe_app_reload", return_value="not_reloaded"
+        ), mock.patch.object(sw, "app_pid", return_value=999), mock.patch.object(
+            sw, "running_inside_app", return_value=True
+        ), mock.patch.object(sw, "restart_app") as restarted:
+            result = sw.switch(
+                self.vault,
+                self.auth_file,
+                "B号",
+                verify_seconds=0.5,
+                settle_seconds=0.0,
+                log=lambda _: None,
+            )
+        self.assertEqual(result.status, "pending")
+        self.assertTrue(result.needs_restart)
+        restarted.assert_not_called()
+
+    def test_known_dead_skips_probe(self) -> None:
+        """同一 App 进程上次就失效 → 不再白等，直接走恢复。"""
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self.add_b_snapshot()
+        self.vault.record_reload(999, False, UID_A)
+        fake = sw.SwitchResult("ok", "已重启", sw.EXIT_OK, verified_by="restart")
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "app_pid", return_value=999
+        ), mock.patch.object(sw, "running_inside_app", return_value=False), mock.patch.object(
+            sw, "restart_app", return_value=fake
+        ), mock.patch.object(sw, "probe_app_reload") as probe:
+            result = sw.switch(
+                self.vault,
+                self.auth_file,
+                "B号",
+                verify_seconds=0.5,
+                settle_seconds=0.0,
+                log=lambda _: None,
+            )
+        probe.assert_not_called()
+        self.assertEqual(result.status, "ok")
 
     def test_switch_noop(self) -> None:
         self.vault.snapshot(read_state(self.auth_file), alias="A号")
@@ -222,7 +310,9 @@ class TestSwitch(BaseCase):
     def test_restore_latest(self) -> None:
         self.vault.snapshot(read_state(self.auth_file), alias="A号")
         self.add_b_snapshot()
-        with mock.patch.object(sw, "app_is_running", return_value=True):
+        with mock.patch.object(sw, "app_is_running", return_value=True), mock.patch.object(
+            sw, "probe_app_reload", return_value="reloaded"
+        ):
             sw.switch(self.vault, self.auth_file, "B号", verify_seconds=0.5, settle_seconds=0.0, log=lambda _: None)
         self.assertEqual(read_state(self.auth_file).uid, UID_B)
         result = sw.restore_latest(self.vault, self.auth_file, log=lambda _: None)

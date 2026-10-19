@@ -38,6 +38,10 @@ python3 wbvault.py snapshot --alias 主号   # 收录当前账号
 | `snapshot [--alias 名字]` | 收录当前登录态 |
 | `switch <uid\|前缀\|别名\|邮箱\|uin>` | 切换账号 |
 | `switch <账号> --with-current` | 切换并把当前会话过继过去 |
+| `switch <账号> --restart` | 切换；App 没热重载时自动重启它 |
+| `switch <账号> --no-restart` | 只写文件，不自动重启（默认会重启） |
+| `restart-app` | 重启 WorkBuddy AI，让写入的登录态生效 |
+| `config [auto-restart on\|off]` | 查看/修改「热重载失败时自动重启」开关 |
 | `handover <会话\|current> --to <账号>` | 只过继会话，不切登录态 |
 | `handovers [--undo]` | 查看/撤销过继 |
 | `sessions [--all]` | 各账号的会话与空间归属（只读） |
@@ -61,7 +65,7 @@ python3 wbvault.py --json switch 主号 --with-current
 python3 wbvault.py --json handovers --undo
 ```
 
-退出码：`0` 成功 / `1` 失败（已回滚） / `2` 参数或账号不存在 / `3` 已写入但未确认。
+退出码：`0` 成功 / `1` 失败（已回滚） / `2` 参数或账号不存在 / `3` 已写入但未确认（`--json` 里 `needsRestart` 为 `true` 时表示要重启 App）。
 
 ## 路径
 
@@ -78,6 +82,7 @@ python3 wbvault.py --json handovers --undo
 - 会话按 `user_id` 隔离；切换不删除会话，只是侧边栏换一批。
 - 过继只支持 `transport=local` 的会话，且是移动不是复制。
 - 过继会把会话的「最近活动」更新为当前时间，所以它排在侧边栏最上面；但 App 热切换后打开哪一页由 App 自己决定（外部只能写 `startup-route.json`，App 不重读）。重启 App 会直接落在该会话。
+- 热切换依赖 App 自己的目录监听，它会静默失效且无法从外部唤醒；失效时只能重启 App（工具默认会自动做，见「排错」）。
 - 长期不用的账号 refresh token 可能失效，需重新登录。
 - 非官方工具，WorkBuddy 升级后内部路径可能变化，先跑 `doctor` 确认。
 
@@ -117,4 +122,23 @@ python3 wbvault.py install     # 强制刷新副本 + 重装常驻监听
 重新编译 App 也会带上最新源码：`tools/wbvault/menubar/build.sh`。
 
 **切换带会话时提示「会话未过继」**：会话已属于目标账号、或属于云端会话（`transport≠local`）时会跳过过继但**照常切换登录态**；写库失败则中止切换，避免会话看起来丢了。用 `wbvault handovers` 看过继记录，`--undo` 可撤回。
+
+**提示「登录态已写入，但 App 没有热重载」（退出码 3）**
+
+App 靠自己的目录监听（`fs.watch` 监听 `…/Public/auth/`）发现外部改动，再重新读文件。这个监听会**静默失效**：它不报错、不重试，App 内部还停在旧账号，只有重启才会走 `restore()` 重新读文件。
+
+实测过：失效之后，`os.utime`、原地覆写、在目录里增删文件都唤不醒它——**外部无法重建监听，唯一入口就是重启 App**。
+
+所以默认行为是「切完自动兜底」，不用手动点：
+
+1. 写文件 → 校验字节；
+2. 核对 App 日志（`~/.workbuddy-ai/logs/<日期>/workbuddyMainThread*.log` 里的 `Restored auth session from file, userId: …`）确认真的换了账号；
+3. 没换 → 自动退出并重开 App，等它加载到目标账号再报成功（`verifiedBy: restart`）。
+
+细节：
+
+- 同一个 App 进程上次就失效过时，会记住（`reload-state.json`），下次直接走重启，不再白等；
+- **从 App 内部调用**（Agent / 内置终端）不会自动重启——那会把正在跑命令的 App 一起掐掉，此时只报 `pending`，去菜单栏点「重启 WorkBuddy 生效」；
+- 不想自动重启：`wbvault config auto-restart off`，或单次 `switch <账号> --no-restart`；
+- 想随时看监听还灵不灵：`wbvault doctor --probe`（只动 mtime，不改内容）。
 

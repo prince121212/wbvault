@@ -319,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(hint)
 
         menu.addItem(menuItem("采集当前账号", #selector(snapshotCurrent)))
+        menu.addItem(menuItem("重启 WorkBuddy 生效", #selector(restartApp)))
         menu.addItem(menuItem("刷新列表", #selector(refreshMenu)))
         menu.addItem(.separator())
 
@@ -344,6 +345,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func snapshotCurrent() {
         runAsync(["snapshot"], successFlash: "已采集")
+    }
+
+    @objc func restartApp() {
+        runAsync(["restart-app"], successFlash: "已重启")
     }
 
     @objc func switchAccount(_ sender: NSMenuItem) {
@@ -394,6 +399,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
                         self.setStatusText(nil)
                     }
+                } else if code == 3 {
+                    // 3 = 登录态写进去了，但 App 没热重载；只能重启才看得见
+                    self.setStatusText(nil)
+                    self.showRestartOffer(output)
                 } else {
                     self.setStatusText(nil)
                     self.showError(output, code: code)
@@ -424,6 +433,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return lines[index...].joined(separator: "\n")
         }
         return lines.suffix(10).joined(separator: "\n")
+    }
+
+    /// 退出码 3：文件写对了，但 WorkBuddy 没热重载 —— 给一个「现在重启」的按钮。
+    func showRestartOffer(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "切换已写入，但 WorkBuddy 没有热重载"
+        alert.informativeText = message + "\n\n重启 App 才会切过去（会结束当前会话）。"
+        alert.addButton(withTitle: "现在重启")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            runAsync(["restart-app"], successFlash: "已重启")
+        }
     }
 
     func showError(_ message: String, code: Int32) {
