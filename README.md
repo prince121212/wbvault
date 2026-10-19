@@ -121,13 +121,13 @@ open tools/wbvault/WBVault.app
 
 为什么要退出再开：运行中的进程用的是已经加载进内存的旧二进制；Python 那部分（内置的 `runtime-src`）也只在 App 启动时才校准到 `~/Library/Application Support/WorkBuddyAccountVault/runtime/`。
 
-**核对是不是最新**：菜单最下面一行「版本 `05883e3` @ 2026-10-19 16:19」，或
+**核对是不是最新**：菜单最下面一行「版本 2026-10-19 16:19」，或
 
 ```bash
 tools/wbvault/WBVault.app/Contents/MacOS/WBVault --status
 ```
 
-带 `-dirty` 表示那次构建时工作区有未提交的改动，不是干净的发布版。
+菜单里只报**构建时间**——判断新旧看它最准（`pull` 完重新打开，时间变了就是更新到了）。`--status` 里还能看到构建时的 commit 和内置源码指纹，方便对不上时排查。commit 会比「发布那次提交」慢一拍，因为发布流程是先编译、后提交，这是正常的。
 
 **如果是下载 ZIP 而不是 clone**：解压出来的文件带 quarantine 标记，首次打开会被系统拦住（「无法验证开发者」或「已损坏」）。二选一：
 

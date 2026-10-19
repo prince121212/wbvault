@@ -149,10 +149,14 @@ func buildInfo() -> [String: String] {
 }
 
 func buildLabel() -> String {
+    // 只报构建时间：发布流程是「先编译、后提交」，hash 天然比提交慢一拍，
+    // 拿它比对会误判；时间才是判断新旧的唯一可靠依据。
+    buildInfo()["built"] ?? "unknown"
+}
+
+func buildDetail() -> String {
     let info = buildInfo()
-    let commit = info["commit"] ?? "unknown"
-    let built = info["built"] ?? "unknown"
-    return "\(commit) @ \(built)"
+    return "\(buildLabel())（commit \(info["commit"] ?? "?")，源码指纹 \(info["stamp"] ?? "?")）"
 }
 
 // MARK: - 监听进程
@@ -588,7 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 let arguments = CommandLine.arguments
 if arguments.contains("--status") {
     print("app: \(Bundle.main.bundlePath)")
-    print("version: \(buildLabel())")
+    print("version: \(buildDetail())")
     print("watcher: \(isWatcherRunning() ? "running" : "stopped")")
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")
