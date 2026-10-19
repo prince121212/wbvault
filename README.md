@@ -2,6 +2,8 @@
 
 WorkBuddy AI 的本地多账号切换工具（macOS）。登录过的账号留在本机，一条命令切换，不重启、不重新登录。
 
+切换默认是**无感**的：切过去侧边栏不换一批，本机所有会话都还在（见「账号无感切换」）。
+
 ## 环境
 
 - macOS 13+
@@ -29,6 +31,8 @@ python3 wbvault.py snapshot --alias 主号   # 收录当前账号
 
 然后正常登出、登录另一个账号，会自动收录。`list` 出现两个账号后即可切换。
 
+切过去侧边栏不会换一批：默认开着「切换时保留全部会话」，本机所有会话都在（见「账号无感切换」）。
+
 ## 命令
 
 | 命令 | 作用 |
@@ -36,15 +40,22 @@ python3 wbvault.py snapshot --alias 主号   # 收录当前账号
 | `list` | 列出账号（`*` 为当前，带邮箱） |
 | `current` | 当前账号详情 |
 | `snapshot [--alias 名字]` | 收录当前登录态 |
-| `switch <uid\|前缀\|别名\|邮箱\|uin>` | 切换账号 |
-| `switch <账号> --with-current` | 切换并把当前会话过继过去 |
+| `switch <uid\|前缀\|别名\|邮箱\|uin>` | 切换账号（默认把本机所有会话一起带过去） |
+| `switch <账号> --no-share` | 切换但不共享：目标账号只看得到自己的会话 |
+| `switch <账号> --no-keep-route` | 切完让 App 自己决定打开哪一页 |
 | `switch <账号> --restart` | 切换；App 没热重载时自动重启它 |
 | `switch <账号> --no-restart` | 只写文件，不自动重启（默认会重启） |
 | `restart-app` | 重启 WorkBuddy AI，让写入的登录态生效 |
-| `config [auto-restart on\|off]` | 查看/修改「热重载失败时自动重启」开关 |
-| `handover <会话\|current> --to <账号>` | 只过继会话，不切登录态 |
-| `handovers [--undo]` | 查看/撤销过继 |
-| `sessions [--all]` | 各账号的会话与空间归属（只读） |
+| `config` | 查看设置（auto-restart / share / keep-route） |
+| `config <键> on\|off` | 改设置，键为 `auto-restart`、`share`、`keep-route` |
+| `share [--to 账号]` | 把本机所有会话共享给某个账号（默认当前账号） |
+| `unshare` | 按记录把会话还回各自的原始账号 |
+| `spaces [--all]` | 查看会话空间（按本地目录分组），标出同名冲突 |
+| `spaces --merge-same-name [--yes]` | 合并「目录名相同、路径不同」的空间（默认只演练） |
+| `spaces --undo` | 撤销最近一次空间合并 |
+| `handover <会话\|current> --to <账号>` | 只把某一条会话过继过去，不切登录态 |
+| `handovers [--undo]` | 查看/撤销单条过继 |
+| `sessions [--all]` | 各账号的会话、空间与原始归属（只读） |
 | `alias <账号> <名字>` | 起别名 |
 | `email <账号> <邮箱>` | 手动记邮箱（留空清除） |
 | `watch [--once]` | 常驻采集 |
@@ -61,11 +72,55 @@ python3 wbvault.py snapshot --alias 主号   # 收录当前账号
 ```bash
 python3 wbvault.py --json list
 python3 wbvault.py --json switch 主号
-python3 wbvault.py --json switch 主号 --with-current
+python3 wbvault.py --json share --to 主号
+python3 wbvault.py --json unshare
 python3 wbvault.py --json handovers --undo
 ```
 
 退出码：`0` 成功 / `1` 失败（已回滚） / `2` 参数或账号不存在 / `3` 已写入但未确认（`--json` 里 `needsRestart` 为 `true` 时表示要重启 App）。
+
+`switch --json` 里多一段 `share`，报告这次共享了几条会话、原来分别属于谁。
+
+## 账号无感切换（会话共享）
+
+目标：账号 A 有会话 1、2，账号 B 有会话 3、4；A 切到 B 之后，1、2、3、4 都在侧边栏里，而不是「换一批」。
+
+**原理**（从 App 自己的 SQL 反推出来的）：决定「谁看得见某个会话」的只有 `workbuddy.db` 里 `sessions.user_id` 一个字段——
+
+```sql
+WHERE transport = 'local' AND deleted_at IS NULL
+  AND (user_id = ? OR user_id = '')
+```
+
+而消息本体在 `projects/<目录名>/<sessionId>.jsonl`，**不带账号**。所以把本机所有本地会话的 `user_id` 归到目标账号，切过去就是「会话全在」，一条都不用复制，历史一个字不少。
+
+具体做法：
+
+1. 切换前先把本机所有 `transport=local` 的会话归到目标账号，原始归属记进 `ownership.json`；
+2. 再写登录态。顺序不能反：App 收到登录态变更会立刻重读侧边栏，写晚了这一轮看不到新会话（得再触发一次刷新）；
+3. 登录态没切成（回滚/出错）就把会话归位回原账号，否则原账号侧边栏会空；
+4. 顺手把 `startup-route.json` 抄给目标账号，切完（以及重启后）还停在同一页。
+
+默认就开着（`wbvault config share on`）。不想要：`wbvault config share off`，或单次 `switch <账号> --no-share`。
+
+- 云端会话（`transport != 'local'`）一律不碰，它们跟着服务端走；
+- 单条过继 `handover` 仍然可用，但共享模式下没必要——它反而会把那条会话变回「私有」。
+
+### 空间（工作区）
+
+空间在 App 里就是**会话按 `cwd` 分组**，所以：
+
+- **同一个本地目录**（两个账号打开的是同一个文件夹）→ 共享后自动并成一个空间，会话并排出现，不用做任何事；
+- **目录名相同、路径不同**（例如 `/a/proj` 和 `/b/proj`）→ 会显示成两个同名空间。`wbvault spaces` 会标出来，`wbvault spaces --merge-same-name` 可以把它们并到保留的那个路径上（会话的 `cwd` 和 `projects/` 下的记录一起搬，默认只演练，加 `--yes` 才动手，`spaces --undo` 可撤回）。
+
+注意：合并同名空间等于把会话挂到另一个目录上，之后这些会话就在那个目录里干活。只有确认两个目录是同一份项目时才值得合并。
+
+### 还原
+
+```bash
+python3 wbvault.py unshare           # 全部按原始归属还回去
+python3 wbvault.py unshare --dry-run # 先看会动哪些
+```
 
 ## 路径
 
@@ -74,14 +129,16 @@ python3 wbvault.py --json handovers --undo
 | 登录态（唯一真相） | `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info` |
 | 账号库 | `~/Library/Application Support/WorkBuddyAccountVault/` |
 | 会话库 | `~/.workbuddy-ai/workbuddy.db` |
+| 会话消息 | `~/.workbuddy-ai/projects/<目录名>/<sessionId>.jsonl`（不带账号） |
+| 原始归属记录 | `~/Library/Application Support/WorkBuddyAccountVault/ownership.json` |
 | 采集日志 | `~/Library/Logs/wbvault-watch.log` |
 
 ## 限制
 
 - 快照里的 token 用本机 `keyblob` 加密，**机器绑定**，不可跨机迁移。
-- 会话按 `user_id` 隔离；切换不删除会话，只是侧边栏换一批。
-- 过继只支持 `transport=local` 的会话，且是移动不是复制。
-- 过继会把会话的「最近活动」更新为当前时间，所以它排在侧边栏最上面；但 App 热切换后打开哪一页由 App 自己决定（外部只能写 `startup-route.json`，App 不重读）。重启 App 会直接落在该会话。
+- 共享会改写 `sessions.user_id`（原始归属另存 `ownership.json`，`unshare` 可还原）。App 升级后如果改了可见性规则，先跑 `doctor` 看「会话共享」一项。
+- 过继/共享只对 `transport=local` 的会话有效；云端会话跟服务端走，切账号时本来就是各看各的。
+- 过继会把会话的「最近活动」更新为当前时间，所以它排在侧边栏最上面；共享不动时间戳。但 App 热切换后打开哪一页由 App 自己决定（外部只能写 `startup-route.json`，App 不重读）。重启 App 会直接落在该会话。
 - 热切换依赖 App 自己的目录监听，它会静默失效且无法从外部唤醒；失效时只能重启 App（工具默认会自动做，见「排错」）。
 - 长期不用的账号 refresh token 可能失效，需重新登录。
 - 非官方工具，WorkBuddy 升级后内部路径可能变化，先跑 `doctor` 确认。
@@ -157,7 +214,9 @@ python3 wbvault.py install     # 强制刷新副本 + 重装常驻监听
 
 重新编译 App 也会带上最新源码：`tools/wbvault/menubar/build.sh`。
 
-**切换带会话时提示「会话未过继」**：会话已属于目标账号、或属于云端会话（`transport≠local`）时会跳过过继但**照常切换登录态**；写库失败则中止切换，避免会话看起来丢了。用 `wbvault handovers` 看过继记录，`--undo` 可撤回。
+**切换后侧边栏还是只有目标账号自己的会话**：确认共享是开着的（`wbvault config`，或菜单里「切换时保留全部会话」有没有勾）。关着的话单次 `wbvault share --to <账号>` 也能补上。共享只对本地会话生效，云端会话各看各的是正常的。
+
+**切换带会话时提示「会话未过继」**：这是老的单条过继（`--with-current`）。会话已属于目标账号、或属于云端会话（`transport≠local`）时会跳过过继但**照常切换登录态**；写库失败则中止切换，避免会话看起来丢了。共享模式下不需要它，用 `wbvault share` / `unshare` 代替。
 
 **提示「登录态已写入，但 App 没有热重载」（退出码 3）**
 

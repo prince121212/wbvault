@@ -501,3 +501,179 @@ class TestHandover(BaseCase):
         result = ho.handover(self.vault, db, "不存在的会话", UID_B)
         self.assertEqual(result.status, "error")
         self.assertIn("找不到会话", result.message)
+
+
+class TestShare(BaseCase):
+    """会话共享：切账号时所有会话都跟着走。"""
+
+    def _make_db(self) -> Path:
+        import sqlite3
+
+        db = self.tmp / "workbuddy.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "create table sessions (id text primary key, user_id text, title text, cwd text, "
+            "transport text default 'local', status text, deleted_at integer, "
+            "last_activity_at integer, created_at integer, is_playground integer default 0)"
+        )
+        conn.execute("create table workspaces (path text primary key, last_opened_at integer)")
+        rows = [
+            ("a-1", UID_A, "A 的会话", "/Users/x/proj-alpha"),
+            ("a-2", UID_A, "A 的另一个", "/Users/x/proj-alpha"),
+            ("b-1", UID_B, "B 的会话", "/Users/x/proj-beta"),
+            ("b-2", UID_B, "B 在同一个目录", "/Users/x/proj-alpha"),
+        ]
+        for sid, uid, title, cwd in rows:
+            conn.execute(
+                "insert into sessions (id,user_id,title,cwd,transport,status,created_at,last_activity_at)"
+                " values (?,?,?,?,'local','completed',1,1)",
+                (sid, uid, title, cwd),
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    def _count(self, db: Path, sql: str, args: tuple = ()) -> int:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db))
+        try:
+            return conn.execute(sql, args).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_claim_all_moves_every_session(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            result = share.claim_all(self.vault, db, UID_A)
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual(result.changed, 2)
+        self.assertEqual(self._count(db, "select count(*) from sessions where user_id=?", (UID_A,)), 4)
+
+    def test_claim_records_original_owner(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            share.claim_all(self.vault, db, UID_A)
+        self.assertEqual(share.owner_of(self.vault, "b-1"), UID_B)
+        self.assertEqual(share.owner_of(self.vault, "a-1"), UID_A)
+
+    def test_restore_puts_sessions_back(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            share.claim_all(self.vault, db, UID_A)
+            result = share.restore_ownership(self.vault, db)
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual(self._count(db, "select count(*) from sessions where user_id=?", (UID_B,)), 2)
+
+    def test_claim_dry_run_does_not_write(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            result = share.claim_all(self.vault, db, UID_A, dry_run=True)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(self._count(db, "select count(*) from sessions where user_id=?", (UID_B,)), 2)
+
+    def test_claim_is_noop_when_already_shared(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            share.claim_all(self.vault, db, UID_A)
+            again = share.claim_all(self.vault, db, UID_A)
+        self.assertEqual(again.status, "noop")
+
+    def test_cloud_sessions_are_left_alone(self) -> None:
+        import sqlite3
+
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        conn = sqlite3.connect(str(db))
+        conn.execute("update sessions set transport='cloud' where id='b-1'")
+        conn.commit()
+        conn.close()
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            share.claim_all(self.vault, db, UID_A)
+        self.assertEqual(
+            self._count(db, "select user_id from sessions where id='b-1'"), UID_B
+        )
+
+    def test_spaces_group_by_cwd(self) -> None:
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        items = {item["cwd"]: item for item in share.spaces(db)}
+        self.assertEqual(items["/Users/x/proj-alpha"]["sessions"], 3)
+        self.assertEqual(items["/Users/x/proj-alpha"]["name"], "proj-alpha")
+
+    def test_compress_workspace_name(self) -> None:
+        import wbvault_lib.share as share
+
+        self.assertEqual(
+            share.compress_workspace_name("/Users/luzhanghua/work/chuanglian/officialWebsite"),
+            "Users-luzhanghua-work-chuanglian-officialWebsite",
+        )
+        self.assertEqual(
+            share.compress_workspace_name("/Users/luzhanghua/WorkBuddy AI/2026-10-19-17-08-48"),
+            "Users-luzhanghua-WorkBuddy AI-2026-10-19-17-08-48",
+        )
+        long_path = "/tmp/" + "x" * 300
+        self.assertLessEqual(len(share.compress_workspace_name(long_path).encode("utf-8")), 255)
+
+    def test_same_name_groups_detects_collision(self) -> None:
+        import wbvault_lib.share as share
+
+        items = [
+            {"cwd": "/a/proj", "name": "proj", "sessions": 3, "lastActivityAt": 10},
+            {"cwd": "/b/proj", "name": "proj", "sessions": 1, "lastActivityAt": 5},
+            {"cwd": "/c/other", "name": "other", "sessions": 1, "lastActivityAt": 1},
+        ]
+        groups = share.same_name_groups(items)
+        self.assertEqual(list(groups.keys()), ["proj"])
+
+    def test_merge_same_name_moves_cwd_and_files(self) -> None:
+        import sqlite3
+
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        conn = sqlite3.connect(str(db))
+        conn.execute("update sessions set cwd='/b/proj' where id='b-1'")
+        conn.execute("update sessions set cwd='/a/proj' where id in ('a-1','a-2')")
+        conn.commit()
+        conn.close()
+
+        projects = self.tmp / "projects"
+        src = projects / share.compress_workspace_name("/b/proj")
+        src.mkdir(parents=True)
+        (src / "b-1.jsonl").write_text("{}", "utf-8")
+
+        with mock.patch.object(share, "PROJECTS_DIR", projects), mock.patch.object(
+            share, "WORKBUDDY_HOME", self.tmp / "wb-home"
+        ):
+            result = share.merge_same_name(self.vault, db, dry_run=False)
+
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual(self._count(db, "select count(*) from sessions where cwd='/a/proj'"), 3)
+        moved = projects / share.compress_workspace_name("/a/proj") / "b-1.jsonl"
+        self.assertTrue(moved.is_file())
+
+    def test_carry_route_copies_current_page(self) -> None:
+        import wbvault_lib.share as share
+
+        home = self.tmp / "wb-home"
+        (home / UID_A).mkdir(parents=True)
+        (home / UID_A / "startup-route.json").write_text(
+            json.dumps({"path": "/conversation/abc-123", "savedAt": 1}), "utf-8"
+        )
+        with mock.patch.object(share, "WORKBUDDY_HOME", home):
+            self.assertTrue(share.carry_route(UID_A, UID_B))
+        data = json.loads((home / UID_B / "startup-route.json").read_text("utf-8"))
+        self.assertEqual(data["path"], "/conversation/abc-123")
