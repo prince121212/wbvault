@@ -21,7 +21,8 @@ mkdir -p "$APP/Contents/MacOS" "$RES"
 swiftc -O -swift-version 5 \
   -target arm64-apple-macos13.0 \
   -framework AppKit \
-  -o "$BIN" "$HERE/WBVault.swift"
+  -framework ApplicationServices \
+  -o "$BIN" "$HERE/main.swift" "$HERE/AutoRetry.swift"
 
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 
@@ -48,6 +49,15 @@ PY
 printf '%s\n' "$STAMP" > "$RES/runtime-src/.stamp"
 
 chmod +x "$BIN"
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# 自签名（ad-hoc）+ 固定的「设计要求」。
+#
+# 不写 -r 的话，codesign 会把设计要求定成 cdhash，也就是钉死这一份二进制；
+# 每次重新编译 cdhash 都变，系统就认为「这不是同一个 App」，
+# 用户在「隐私与安全性 → 辅助功能」里勾的那一下会失效。
+# 显式写成 identifier 之后，授权只认 bundle id，重编译不用再勾一次。
+codesign --force --sign - \
+  --identifier ai.workbuddy.wbvault.menu \
+  -r='designated => identifier "ai.workbuddy.wbvault.menu"' \
+  "$APP" >/dev/null 2>&1 || codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "已构建：${APP}（运行时源码指纹 ${STAMP}）"

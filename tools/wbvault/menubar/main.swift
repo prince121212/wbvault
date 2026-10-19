@@ -197,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         syncBundledRuntime()
         startWatcherIfNeeded()
+        AutoRetry.shared.start()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -208,6 +209,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+
+        // 开着自动重试却没拿到权限时，早点说清楚，别等用户发现「怎么没生效」
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if AutoRetry.shared.enabled, !AutoRetry.shared.trusted {
+                self.showPermissionAlert()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -323,6 +331,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(menuItem("刷新列表", #selector(refreshMenu)))
         menu.addItem(.separator())
 
+        // 自动重试：模型繁忙（14003）中断后自动点「重试」
+        let retry = AutoRetry.shared
+        let retryItem = menuItem(retry.enabled ? "自动重试：开" : "自动重试：关", #selector(toggleAutoRetry))
+        retryItem.state = retry.enabled ? .on : .off
+        menu.addItem(retryItem)
+        if retry.enabled {
+            let detail: String
+            if retry.trusted {
+                detail = "已授权 · 已重试 \(retry.totalPresses) 次"
+            } else {
+                detail = "缺权限（勾了也不生效？点这里看修法）"
+            }
+            let sub = NSMenuItem(
+                title: "  " + detail,
+                action: retry.trusted ? nil : #selector(fixPermission),
+                keyEquivalent: ""
+            )
+            sub.target = self
+            sub.isEnabled = !retry.trusted
+            menu.addItem(sub)
+        }
+        menu.addItem(.separator())
+
         let autoStart = menuItem(loginItemInstalled() ? "开机自启：已开启" : "开机自启：关闭", #selector(toggleLoginItem))
         autoStart.state = loginItemInstalled() ? .on : .off
         menu.addItem(autoStart)
@@ -365,6 +396,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runAsync(["handovers", "--undo"], successFlash: "已撤销")
     }
 
+    @objc func toggleAutoRetry() {
+        let retry = AutoRetry.shared
+        retry.enabled.toggle()
+        if retry.enabled, !retry.trusted {
+            showPermissionAlert()
+        }
+        refreshMenu()
+    }
+
+    @objc func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 菜单里那一行「缺权限」：先说清楚为什么，再给按钮去设置
+    @objc func fixPermission() {
+        showPermissionAlert()
+    }
+
     @objc func toggleLoginItem() {
         let installed = loginItemInstalled()
         let (ok, message) = installed ? removeLoginItem() : installLoginItem()
@@ -376,14 +427,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenu()
     }
 
-    func showInfo(_ message: String) {
+    func showInfo(_ message: String, title: String = "提示") {
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = "开机自启"
+        alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    /// 「设置里明明勾着，工具却说没权限」——系统授权绑的是这一份二进制，
+    /// 工具重新编译后旧授权就作废了，但列表里的勾是另一条记录，所以还亮着。
+    /// 光取消勾选再勾上没用：那只会改「允许/禁止」，不会重算指纹。
+    /// 必须把整条记录删掉，让系统重新记一次。
+    func showPermissionAlert() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "自动重试还差一步授权"
+        alert.informativeText = """
+        现象：系统设置里 WBVault 明明是勾上的，工具却提示缺「辅助功能」权限。
+
+        原因：macOS 的授权记的是「这一份二进制的指纹」。工具重新编译后指纹变了，
+        旧记录就对不上；而列表里那个勾属于旧记录，所以看着还亮着。
+        取消再勾选只是改「允许/禁止」，指纹不会重算，因此不管用。
+
+        点下面这个按钮：我会把旧记录删掉，再让系统重新弹一次授权。
+        到时候在列表里把 WBVault 勾上就行。
+        """
+        alert.addButton(withTitle: "重置并重新授权")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let (code, output) = shell("/usr/bin/tccutil", ["reset", "Accessibility", "ai.workbuddy.wbvault.menu"])
+        if code != 0 {
+            showInfo(
+                "重置失败：\(output)\n\n"
+                + "手动做法：系统设置 → 隐私与安全性 → 辅助功能，选中 WBVault，\n"
+                + "点列表下方的「−」把它删掉，然后重新打开 WBVault，系统会再问一次。",
+                title: "没能自动重置"
+            )
+            return
+        }
+        AutoRetry.shared.requestPermission()
+        showInfo(
+            "旧记录已清掉，系统马上会弹「WBVault 想要控制这台电脑」。\n\n"
+            + "点「打开系统设置」，在辅助功能列表里把 WBVault 打开即可。\n"
+            + "授权成功后菜单里会显示「已授权」，不用重启 App。",
+            title: "现在去勾选 WBVault"
+        )
     }
 
     func runAsync(_ args: [String], successFlash: String) {
@@ -473,7 +566,28 @@ if arguments.contains("--status") {
     print("watcher: \(isWatcherRunning() ? "running" : "stopped")")
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")
+    print("autoRetry: \(AutoRetry.shared.enabled ? "on" : "off")")
     exit(0)
+}
+if arguments.contains("--ax-trusted") {
+    print("trusted: \(AutoRetry.shared.trusted ? "yes" : "no")")
+    exit(0)
+}
+if arguments.contains("--ax-test") {
+    // 授权后跑一次：确认能读到页面里的「重试」按钮
+    for line in AutoRetry.shared.diagnose() { print(line) }
+    exit(0)
+}
+if arguments.contains("--ax-dump") {
+    // 树结构不对时用它看清楚
+    for line in AutoRetry.shared.dumpTree() { print(line) }
+    exit(0)
+}
+if arguments.contains("--reset-permission") {
+    // 删掉系统里那条「绑着旧二进制」的授权记录，让下次启动重新弹授权
+    let (code, output) = shell("/usr/bin/tccutil", ["reset", "Accessibility", "ai.workbuddy.wbvault.menu"])
+    print(code == 0 ? "permission: reset" : "permission: reset failed: \(output)")
+    exit(code == 0 ? 0 : 1)
 }
 if arguments.contains("--menu") {
     // 只是把菜单会显示的文字打出来，方便核对显示逻辑
