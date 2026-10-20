@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wbvault_lib import agent as agent_mod  # noqa: E402
 from wbvault_lib import format as fmt  # noqa: E402
 from wbvault_lib import handover as handover_mod  # noqa: E402
+from wbvault_lib import share as share_mod  # noqa: E402
 from wbvault_lib.authfile import (  # noqa: E402
     AuthFileError,
     list_backups,
@@ -79,7 +80,33 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument(
         "--with-current",
         action="store_true",
-        help="把当前打开的会话一起过继到目标账号，切过去可继续",
+        help="只把当前打开的会话过继到目标账号（旧的单条过继；共享模式下不需要）",
+    )
+    sw.add_argument(
+        "--share",
+        dest="share",
+        action="store_true",
+        default=None,
+        help="切换时把本机所有会话都带过去（默认，见 wbvault config share）",
+    )
+    sw.add_argument(
+        "--no-share",
+        dest="share",
+        action="store_false",
+        help="这次切换不共享会话：目标账号只看得到自己的",
+    )
+    sw.add_argument(
+        "--keep-route",
+        dest="keep_route",
+        action="store_true",
+        default=None,
+        help="切完还停在同一页会话（默认开）",
+    )
+    sw.add_argument(
+        "--no-keep-route",
+        dest="keep_route",
+        action="store_false",
+        help="切完让 App 自己决定打开哪一页",
     )
     sw.add_argument(
         "--restart",
@@ -99,6 +126,22 @@ def build_parser() -> argparse.ArgumentParser:
     ho.add_argument("--dry-run", action="store_true", help="只演练，不写库")
     ho.add_argument("--db", help="会话数据库路径")
 
+    sh = sub.add_parser("share", help="把本机所有会话共享给某个账号（切过去全都能看到）")
+    sh.add_argument("--to", help="归到哪个账号名下（默认当前登录账号）")
+    sh.add_argument("--dry-run", action="store_true", help="只演练，不写库")
+    sh.add_argument("--db", help="会话数据库路径")
+
+    us = sub.add_parser("unshare", help="按记录把会话还回各自的原始账号")
+    us.add_argument("--dry-run", action="store_true", help="只演练，不写库")
+    us.add_argument("--db", help="会话数据库路径")
+
+    sp = sub.add_parser("spaces", help="查看会话空间（按本地目录分组）")
+    sp.add_argument("--all", action="store_true", help="列出每个空间，含没有同名冲突的")
+    sp.add_argument("--merge-same-name", action="store_true", help="合并「目录名相同、路径不同」的空间")
+    sp.add_argument("--yes", action="store_true", help="真正执行合并（不加只演练）")
+    sp.add_argument("--undo", action="store_true", help="撤销最近一次空间合并")
+    sp.add_argument("--db", help="会话数据库路径")
+
     hs = sub.add_parser("handovers", help="查看/撤销会话过继记录")
     hs.add_argument("--undo", nargs="?", const="latest", help="撤销最近一次，或指定记录 id")
     hs.add_argument("--db", help="会话数据库路径")
@@ -108,8 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("restart-app", help="重启 WorkBuddy AI，让写入的登录态生效（热重载失效时用）")
 
-    cfg = sub.add_parser("config", help="查看/修改设置（auto-restart on|off）")
-    cfg.add_argument("key", nargs="?", help="auto-restart")
+    cfg = sub.add_parser("config", help="查看/修改设置（auto-restart / share / keep-route）")
+    cfg.add_argument("key", nargs="?", help="auto-restart / share / keep-route")
     cfg.add_argument("value", nargs="?", help="on / off")
 
     al = sub.add_parser("alias", help="给账号起别名")
@@ -262,8 +305,20 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         if not args.json:
             print(fmt.paint("  · %s" % message, fmt.DIM))
 
+    db = handover_mod.db_path(getattr(args, "db", None))
+    entry = vault.find(args.selector)
+    target_uid = str(entry["uid"]) if entry else ""
+    try:
+        previous_uid = read_state(auth_file).uid
+    except AuthFileError:
+        previous_uid = vault.active_uid() or ""
+
+    share_on = args.share if getattr(args, "share", None) is not None else vault.share_enabled()
+    keep_route = (
+        args.keep_route if getattr(args, "keep_route", None) is not None else vault.keep_route()
+    )
+
     carried = None
-    # 先过继当前会话，再切登录态：切过去就能接着干
     if getattr(args, "with_current", False):
         # 但「过继」是不可逆的库改动，必须排在目标校验之后：
         # 否则会话已经改到目标账号名下、登录态却因为快照校验失败没切过去，
@@ -287,13 +342,12 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
                 print(fmt.paint(problem.message, fmt.YELLOW))
             return problem.exit_code
         entry = vault.find(args.selector)
-        if entry:
+        if share_on:
+            # 共享模式下所有会话都跟着走，单条过继反而是「把它变回私有」，不做
+            log("已开启会话共享：切换后所有会话都在，不再单独过继当前会话")
+        elif entry:
             moved = handover_mod.handover(
-                vault,
-                handover_mod.db_path(getattr(args, "db", None)),
-                "current",
-                str(entry["uid"]),
-                dry_run=args.dry_run,
+                vault, db, "current", target_uid, dry_run=args.dry_run
             )
             carried = moved.to_dict()
             if not args.json:
@@ -310,17 +364,56 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
             if moved.status == "refused" and not args.json:
                 print(fmt.paint("  · 继续切换登录态（会话未过继）", fmt.YELLOW))
 
-    result = switch(
-        vault,
-        auth_file,
-        args.selector,
-        verify_seconds=args.wait,
-        force=args.force,
-        dry_run=args.dry_run,
-        allow_domain_mismatch=args.allow_domain_mismatch,
-        auto_restart=False if args.no_restart else (True if args.restart else None),
-        log=log,
-    )
+    # 先把会话归到目标账号，再写登录态：App 收到登录态变更会立刻重读侧边栏，
+    # 写晚了这一轮就看不到新会话（得再触发一次刷新）。
+    shared = None
+    if share_on and target_uid and target_uid != previous_uid:
+        shared = share_mod.claim_all(vault, db, target_uid, dry_run=args.dry_run)
+        if not args.json:
+            color = fmt.DIM if shared.status in ("ok", "noop") else fmt.RED
+            print(fmt.paint("  · " + shared.message, color))
+        if shared.status == "error" and not args.force:
+            print(fmt.paint("  · 会话没能共享，已中止切换（登录态未改动）", fmt.YELLOW))
+            return EXIT_FAILED
+
+    try:
+        result = switch(
+            vault,
+            auth_file,
+            args.selector,
+            verify_seconds=args.wait,
+            force=args.force,
+            dry_run=args.dry_run,
+            allow_domain_mismatch=args.allow_domain_mismatch,
+            auto_restart=False if args.no_restart else (True if args.restart else None),
+            log=log,
+        )
+    except Exception:
+        if shared is not None and shared.status == "ok" and previous_uid:
+            share_mod.claim_all(vault, db, previous_uid)
+        raise
+
+    # 登录态没切成（拒绝 / 回滚 / 出错）：会话要还回原账号，否则原账号侧边栏会空掉
+    if (
+        shared is not None
+        and shared.status == "ok"
+        and result.status in ("refused", "rolled_back", "error")
+        and previous_uid
+    ):
+        back = share_mod.claim_all(vault, db, previous_uid)
+        if not args.json:
+            print(fmt.paint("  · 会话已还回 %s（%s）" % (previous_uid[:8], back.status), fmt.YELLOW))
+
+    # 切完还停在同一页：把「当前打开的是哪个会话」抄给目标账号
+    if (
+        keep_route
+        and not args.dry_run
+        and result.status in ("ok", "pending")
+        and target_uid
+        and target_uid != previous_uid
+    ):
+        if share_mod.carry_route(previous_uid, target_uid) and not args.json:
+            log("已把当前打开的会话带到新账号（重启后仍停在这一页）")
 
     # 兼容老参数：--restart 已经内置到 switch 里了，这里只处理它没覆盖到的残留
     if result.needs_restart and getattr(args, "restart", False):
@@ -353,6 +446,8 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         payload = result.to_dict()
         if carried is not None:
             payload["handover"] = carried
+        if shared is not None:
+            payload["share"] = shared.to_dict()
         print_json(payload)
     else:
         color = {
@@ -409,29 +504,43 @@ def cmd_restart_app(vault: Vault, auth_file: Path, args) -> int:
 
 
 def cmd_config(vault: Vault, args) -> int:
-    """auto-restart on|off：热重载失败时要不要自动重启 App。"""
+    """auto-restart / share / keep-route 三个开关。"""
+    keys = {"auto-restart": "autoRestart", "share": "share", "keep-route": "keepRoute"}
+    labels = {
+        "autoRestart": ("自动重启 App", "热重载失败时自动重启，不用手动点"),
+        "share": ("切换时保留全部会话", "切账号时把本机所有会话都带过去"),
+        "keepRoute": ("切完停在同一页", "把当前打开的会话带到新账号"),
+    }
+
     if not args.key:
         data = vault.settings()
         if args.json:
             print_json({"ok": True, "settings": data})
         else:
-            state = "开" if data.get("autoRestart", True) else "关"
-            print("自动重启 App：%s（热重载失败时）" % state)
-            print(fmt.paint("改：wbvault config auto-restart on|off", fmt.DIM))
+            for key, (name, hint) in labels.items():
+                state = "开" if data.get(key, True) else "关"
+                print("%s：%s  %s" % (name, state, fmt.paint(hint, fmt.DIM)))
+            print(fmt.paint("改：wbvault config <auto-restart|share|keep-route> on|off", fmt.DIM))
         return EXIT_OK
 
-    if args.key != "auto-restart":
-        print(fmt.paint("只支持 auto-restart，例如：wbvault config auto-restart off", fmt.YELLOW))
+    field = keys.get(args.key)
+    if not field:
+        print(
+            fmt.paint(
+                "只支持 auto-restart / share / keep-route，例如：wbvault config share off",
+                fmt.YELLOW,
+            )
+        )
         return EXIT_USAGE
     if not args.value:
-        print(fmt.paint("要写成 wbvault config auto-restart on|off", fmt.YELLOW))
+        print(fmt.paint("要写成 wbvault config %s on|off" % args.key, fmt.YELLOW))
         return EXIT_USAGE
     flag = str(args.value).strip().lower() in ("on", "1", "true", "yes", "开")
-    data = vault.set_setting("autoRestart", flag)
+    data = vault.set_setting(field, flag)
     if args.json:
         print_json({"ok": True, "settings": data})
     else:
-        print("自动重启 App：%s" % ("开" if flag else "关"))
+        print("%s：%s" % (labels[field][0], "开" if flag else "关"))
     return EXIT_OK
 
 
@@ -552,64 +661,212 @@ def cmd_repair(vault: Vault, args) -> int:
 
 
 def cmd_sessions(vault: Vault, args) -> int:
-    """只读查询：会话按 user_id 归属，切换账号不会删除任何记录。"""
-    import sqlite3
-
-    db = Path(args.db).expanduser() if args.db else Path.home() / ".workbuddy-ai" / "workbuddy.db"
+    """只读查询：会话现在归谁、原本是谁建的、分布在哪些空间。"""
+    db = share_mod.db_path(getattr(args, "db", None))
     if not db.is_file():
         print(fmt.paint("找不到数据库：%s" % db, fmt.YELLOW))
         return EXIT_USAGE
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=3)
-    except sqlite3.Error as exc:
+        conn = share_mod.connect(db)
+    except Exception as exc:  # noqa: BLE001 - 打不开就如实报，不抛栈
         print(fmt.paint("打不开数据库（先关掉 WorkBuddy 再试）：%s" % exc, fmt.RED))
         return EXIT_FAILED
 
-    aliases = {str(e.get("uid")): (e.get("alias") or "") for e in vault.entries()}
-    try:
-        if args.all:
-            rows = conn.execute(
-                "select user_id, coalesce(title,'-'), cwd, coalesce(last_activity_at, created_at) "
-                "from sessions where deleted_at is null order by coalesce(last_activity_at, created_at) desc"
-            ).fetchall()
-            table_rows = []
-            for uid, title, cwd, ts in rows:
-                table_rows.append(
-                    [
-                        aliases.get(uid) or fmt.short_uid(uid),
-                        fmt.truncate(title, 28),
-                        fmt.truncate(Path(cwd or "-").name or "-", 24),
-                        fmt.ago(int(ts or 0)),
-                    ]
-                )
-            print(fmt.table(["账号", "会话", "空间目录", "最近活动"], table_rows))
-            return EXIT_OK
+    labels = {}
+    for entry in vault.entries():
+        uid = str(entry.get("uid") or "")
+        labels[uid] = entry.get("alias") or entry.get("email") or fmt.short_uid(uid)
 
+    def label(uid: str) -> str:
+        return labels.get(uid) or (fmt.short_uid(uid) if uid else "公共")
+
+    try:
         rows = conn.execute(
-            "select user_id, count(*), count(distinct cwd), max(coalesce(last_activity_at, created_at)) "
-            "from sessions where deleted_at is null group by user_id order by 4 desc"
+            "select id, user_id, coalesce(title, '-') as title, coalesce(cwd, '') as cwd, "
+            "       coalesce(transport, 'local') as transport, "
+            "       coalesce(last_activity_at, created_at) as ts "
+            "from sessions where deleted_at is null "
+            "order by coalesce(last_activity_at, created_at) desc"
         ).fetchall()
         if not rows:
             print("数据库里还没有会话")
             return EXIT_OK
-        table_rows = []
-        for uid, count, spaces, ts in rows:
-            table_rows.append(
-                [
-                    aliases.get(uid) or fmt.short_uid(uid),
-                    str(count),
-                    str(spaces),
-                    fmt.ago(int(ts or 0)),
+
+        if args.all:
+            has_cloud = any(row["transport"] != "local" for row in rows)
+            table_rows = []
+            for row in rows:
+                line = [
+                    label(share_mod.owner_of(vault, str(row["id"]), str(row["user_id"]))),
+                    fmt.truncate(str(row["title"]), 26),
+                    fmt.truncate(Path(row["cwd"] or "-").name or "-", 22),
+                    fmt.ago(int(row["ts"] or 0)),
                 ]
+                if has_cloud:
+                    line.append("云" if row["transport"] != "local" else "")
+                table_rows.append(line)
+            headers = ["原始归属", "会话", "空间目录", "最近活动"]
+            if has_cloud:
+                headers.append("")
+            print(fmt.table(headers, table_rows))
+            return EXIT_OK
+
+        buckets = {}
+        for row in rows:
+            uid = share_mod.owner_of(vault, str(row["id"]), str(row["user_id"]))
+            item = buckets.setdefault(uid, {"n": 0, "cwd": set(), "ts": 0, "cloud": 0})
+            item["n"] += 1
+            item["cwd"].add(row["cwd"])
+            item["ts"] = max(item["ts"], int(row["ts"] or 0))
+            if row["transport"] != "local":
+                item["cloud"] += 1
+
+        table_rows = []
+        for uid, item in sorted(buckets.items(), key=lambda kv: -kv[1]["ts"]):
+            table_rows.append([label(uid), str(item["n"]), str(len(item["cwd"])), fmt.ago(item["ts"])])
+        print(fmt.table(["原始归属", "会话数", "空间数", "最近活动"], table_rows))
+        print(
+            fmt.paint(
+                "\n共 %d 条会话。切换账号不会删除任何记录：开启共享后，"
+                "谁登录都能看到全部本地会话。" % len(rows),
+                fmt.DIM,
             )
-        print(fmt.table(["账号", "会话数", "空间数", "最近活动"], table_rows))
-        print(fmt.paint("\n会话按 user_id 归属；切换账号不会删除任何记录，只是侧边栏换一批。", fmt.DIM))
+        )
         return EXIT_OK
-    except sqlite3.Error as exc:
+    except Exception as exc:  # noqa: BLE001
         print(fmt.paint("查询失败：%s" % exc, fmt.RED))
         return EXIT_FAILED
     finally:
         conn.close()
+
+
+def cmd_share(vault: Vault, auth_file: Path, args) -> int:
+    db = share_mod.db_path(getattr(args, "db", None))
+    if args.to:
+        entry = vault.find(args.to)
+        if not entry:
+            print(fmt.paint("账号库里没有这个账号：%s" % args.to, fmt.YELLOW))
+            return EXIT_USAGE
+        uid = str(entry["uid"])
+    else:
+        try:
+            uid = read_state(auth_file).uid
+        except AuthFileError as exc:
+            print(fmt.paint("读不到当前登录态：%s" % exc, fmt.RED))
+            return EXIT_FAILED
+
+    result = share_mod.claim_all(vault, db, uid, dry_run=args.dry_run)
+    if args.json:
+        print_json(result.to_dict())
+    else:
+        color = fmt.GREEN if result.status == "ok" else (fmt.DIM if result.status == "noop" else fmt.RED)
+        print(fmt.paint(result.message, color))
+        if result.owners:
+            parts = ["%s %d 条" % (fmt.short_uid(uid) or "公共", n) for uid, n in sorted(result.owners.items())]
+            print(fmt.paint("  原有归属：%s" % "、".join(parts), fmt.DIM))
+        if result.backup:
+            print(fmt.paint("  数据库备份：%s" % result.backup, fmt.DIM))
+    return EXIT_OK if result.status in ("ok", "noop") else EXIT_FAILED
+
+
+def cmd_unshare(vault: Vault, args) -> int:
+    db = share_mod.db_path(getattr(args, "db", None))
+    result = share_mod.restore_ownership(vault, db, dry_run=args.dry_run)
+    if args.json:
+        print_json(result.to_dict())
+    else:
+        color = fmt.GREEN if result.status == "ok" else (fmt.DIM if result.status == "noop" else fmt.RED)
+        print(fmt.paint(result.message, color))
+        if result.backup:
+            print(fmt.paint("  数据库备份：%s" % result.backup, fmt.DIM))
+    return EXIT_OK if result.status in ("ok", "noop") else EXIT_FAILED
+
+
+def cmd_spaces(vault: Vault, args) -> int:
+    db = share_mod.db_path(getattr(args, "db", None))
+    if not db.is_file():
+        print(fmt.paint("找不到数据库：%s" % db, fmt.YELLOW))
+        return EXIT_USAGE
+
+    if args.undo:
+        result = share_mod.undo_merge(vault, db)
+        if args.json:
+            print_json(result.to_dict())
+        else:
+            color = fmt.GREEN if result.status == "ok" else (fmt.DIM if result.status == "noop" else fmt.RED)
+            print(fmt.paint(result.message, color))
+        return EXIT_OK if result.status in ("ok", "noop") else EXIT_FAILED
+
+    if args.merge_same_name:
+        result = share_mod.merge_same_name(vault, db, dry_run=not args.yes)
+        if args.json:
+            print_json(result.to_dict())
+            return EXIT_OK if result.status in ("ok", "noop") else EXIT_FAILED
+        color = fmt.GREEN if result.status == "ok" else (fmt.DIM if result.status == "noop" else fmt.RED)
+        print(fmt.paint(result.message, color))
+        for item in result.plan:
+            print(
+                fmt.paint(
+                    "  %s  %s  →  %s（%s 条会话）"
+                    % (item["name"], item["from"], item["to"], item["sessions"]),
+                    fmt.DIM,
+                )
+            )
+        if result.status == "ok" and not args.yes:
+            print(
+                fmt.paint(
+                    "\n只是演练。真要合并加 --yes；合并后这些会话都挂在保留的那个目录上。",
+                    fmt.YELLOW,
+                )
+            )
+        return EXIT_OK if result.status in ("ok", "noop") else EXIT_FAILED
+
+    try:
+        items = share_mod.spaces(db)
+    except Exception as exc:  # noqa: BLE001
+        print(fmt.paint("查询失败：%s" % exc, fmt.RED))
+        return EXIT_FAILED
+
+    if args.json:
+        print_json({"ok": True, "spaces": items})
+        return EXIT_OK
+    if not items:
+        print("还没有任何空间")
+        return EXIT_OK
+
+    duplicates = share_mod.same_name_groups(items)
+    rows = []
+    for item in items:
+        duplicated = item["name"] in duplicates
+        if not args.all and not duplicated:
+            continue
+        rows.append(
+            [
+                fmt.truncate(str(item["name"]), 26),
+                str(item["sessions"]),
+                fmt.ago(int(item["lastActivityAt"])),
+                "同名冲突" if duplicated else "",
+                fmt.truncate(str(item["cwd"]), 46),
+            ]
+        )
+    if not rows:
+        print(fmt.paint("没有同名不同路径的空间（共 %d 个空间）" % len(items), fmt.DIM))
+        print(fmt.paint("加 --all 可以列出全部空间。", fmt.DIM))
+        return EXIT_OK
+    headers = ["空间", "会话数", "最近活动", "", "目录"]
+    if not duplicates:
+        headers = [h for i, h in enumerate(headers) if i != 3]
+        rows = [row[:3] + row[4:] for row in rows]
+    print(fmt.table(headers, rows))
+    if duplicates:
+        print(
+            fmt.paint(
+                "\n同名不同路径：App 里会显示成两个同名空间。要并成一个："
+                "wbvault spaces --merge-same-name（先演练，加 --yes 才动手）",
+                fmt.DIM,
+            )
+        )
+    return EXIT_OK
 
 
 def cmd_handover(vault: Vault, args) -> int:
@@ -747,6 +1004,24 @@ def cmd_doctor(vault: Vault, auth_file: Path, as_json: bool, probe: bool = False
     backups = list_backups(vault.backups_dir)
     add("备份可用", bool(backups), "%d 个备份" % len(backups), critical=False)
 
+    share_db = share_mod.db_path(None)
+    try:
+        info = share_mod.status(vault, share_db)
+    except Exception:  # noqa: BLE001
+        info = {"ok": False}
+    if info.get("ok"):
+        add(
+            "会话共享",
+            vault.share_enabled(),
+            "开（切账号后 %d 条本地会话都可见，已记录 %d 条原始归属）"
+            % (info["total"], info["ownershipRecorded"])
+            if vault.share_enabled()
+            else "关（wbvault config share on 打开）",
+            critical=False,
+        )
+    else:
+        add("会话共享", False, "读不到会话库：%s" % share_db, critical=False)
+
     agent_state = agent_mod.status()
     add("常驻监听", "已加载" in agent_state, agent_state, critical=False)
 
@@ -834,6 +1109,9 @@ def main(argv=None) -> int:
         "repair": lambda: cmd_repair(vault, args),
         "doctor": lambda: cmd_doctor(vault, auth_file, args.json, probe=getattr(args, "probe", False)),
         "sessions": lambda: cmd_sessions(vault, args),
+        "share": lambda: cmd_share(vault, auth_file, args),
+        "unshare": lambda: cmd_unshare(vault, args),
+        "spaces": lambda: cmd_spaces(vault, args),
         "handover": lambda: cmd_handover(vault, args),
         "handovers": lambda: cmd_handovers(vault, args),
         "install": lambda: cmd_install(args, vault),

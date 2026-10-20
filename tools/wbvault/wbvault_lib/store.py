@@ -367,17 +367,24 @@ class Vault:
     # ---------- 设置与运行时状态 ----------
 
     def settings(self) -> Dict[str, Any]:
-        """用户偏好。autoRestart 默认开：热重载失败时自动重启 App，不用手动点。"""
+        """用户偏好。
+
+        - autoRestart：热重载失败时自动重启 App，不用手动点（默认开）；
+        - share：切账号时把本机所有会话都带过去，侧边栏不换一批（默认开）；
+        - keepRoute：切完还停在同一页会话（默认开）。
+        """
+        defaults = {"autoRestart": True, "share": True, "keepRoute": True}
         path = self.root / "settings.json"
         if not path.is_file():
-            return {"autoRestart": True}
+            return dict(defaults)
         try:
             data = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"autoRestart": True}
+            return dict(defaults)
         if not isinstance(data, dict):
-            return {"autoRestart": True}
-        data.setdefault("autoRestart", True)
+            return dict(defaults)
+        for key, value in defaults.items():
+            data.setdefault(key, value)
         return data
 
     def set_setting(self, key: str, value: Any) -> Dict[str, Any]:
@@ -393,6 +400,12 @@ class Vault:
 
     def auto_restart(self) -> bool:
         return bool(self.settings().get("autoRestart", True))
+
+    def share_enabled(self) -> bool:
+        return bool(self.settings().get("share", True))
+
+    def keep_route(self) -> bool:
+        return bool(self.settings().get("keepRoute", True))
 
     def reload_state(self) -> Dict[str, Any]:
         """上一次切换时 App 的热重载结果（按 App 进程 pid 记）。"""

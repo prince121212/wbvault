@@ -6,15 +6,15 @@
 	<dict>
 		<key>Resources/build-info.txt</key>
 		<data>
-		+ae31e0lSaVBFs7h1yuiuFCGPDk=
+		HgM1M87JPR+s2w6fiLEyA7GfwnI=
 		</data>
 		<key>Resources/runtime-src/.stamp</key>
 		<data>
-		u/JCxgjHPPWxBmHpEAIn+gx9Py4=
+		6Z45VUDESSgg9WFbvnZgrIbiDIs=
 		</data>
 		<key>Resources/runtime-src/wbvault.py</key>
 		<data>
-		kTFX5EA8RB8FCaDYXEWa/B1jvfk=
+		pn6ePgWAJyqiU3hbqKSXnUUjaQ4=
 		</data>
 		<key>Resources/runtime-src/wbvault_lib/__init__.py</key>
 		<data>
@@ -44,9 +44,13 @@
 		<data>
 		gQ35jGvJukhIGpf3KbqoqMJGoWw=
 		</data>
+		<key>Resources/runtime-src/wbvault_lib/share.py</key>
+		<data>
+		/Cv/UAtxY2+qpBTN3ApvGjlGxfY=
+		</data>
 		<key>Resources/runtime-src/wbvault_lib/store.py</key>
 		<data>
-		h25C7a8X8LwCqLEKkcjybhtV4Ak=
+		mdtl8/uGRHcWINL+XwTxWuvd0WQ=
 		</data>
 		<key>Resources/runtime-src/wbvault_lib/switch.py</key>
 		<data>
@@ -63,21 +67,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			/aayiuMxmogFOr+vGfQUQHIp2ud1mE5yeEfuD9n30c4=
+			cZgYifwVc4W8GIbpiZqwlWVsBP+y3D+KOItBMdJ9mKI=
 			</data>
 		</dict>
 		<key>Resources/runtime-src/.stamp</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			R//v004Tv9WY+y9ePMrlvlxgsVLvtm9U3Fv76MQh7eg=
+			7XX9LspXsbNiIFx8YFloBWS26O+C5YoE7N8UulI5yVQ=
 			</data>
 		</dict>
 		<key>Resources/runtime-src/wbvault.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			aetmPEj0V3QKA+AaBN2TI5wjvs5rKTo4wugXUq+rOG4=
+			m29u1mu+3+xUkOuw4sWw1ILhRZhngrDR8PwhH68xmb0=
 			</data>
 		</dict>
 		<key>Resources/runtime-src/wbvault_lib/__init__.py</key>
@@ -129,11 +133,18 @@
 			aMSgQGQ8FyhieJk4faZxAahRFNqSD0Ih/ME40SH5M4M=
 			</data>
 		</dict>
+		<key>Resources/runtime-src/wbvault_lib/share.py</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			D7Ck9Ei9CXLE0B6Whfw82+SKo1AvwpOwR3UFPZA1DFQ=
+			</data>
+		</dict>
 		<key>Resources/runtime-src/wbvault_lib/store.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			aWouPeHHFRPCXDjtD6Vg86eGvtAAJMAMhcZjtqfL2H4=
+			ZJ+JVRp0LSOWroiZT5VxOZQ9JUZUQt3GX4R7RoZ6dg0=
 			</data>
 		</dict>
 		<key>Resources/runtime-src/wbvault_lib/switch.py</key>

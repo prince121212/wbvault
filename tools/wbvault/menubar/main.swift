@@ -133,6 +133,37 @@ func loadAccounts() -> [Account] {
     }
 }
 
+// MARK: - 设置与共享状态
+
+/// settings.json 里的开关；缺省一律当「开」，跟 wbvault 的默认值保持一致。
+func settingOn(_ key: String) -> Bool {
+    guard let root = readJSON(vaultRoot.appendingPathComponent("settings.json")) else { return true }
+    return root[key] as? Bool ?? true
+}
+
+func shareEnabled() -> Bool { settingOn("share") }
+
+/// 有没有记过原始归属 —— 有才显示「恢复会话原始归属」。
+func hasOwnershipRecord() -> Bool {
+    guard let root = readJSON(vaultRoot.appendingPathComponent("ownership.json")),
+          let sessions = root["sessions"] as? [String: Any] else { return false }
+    return !sessions.isEmpty
+}
+
+/// 有没有还没撤销的单条过继 —— 有才显示「撤销上次会话过继」。
+func hasHandoverRecord() -> Bool {
+    guard let items = readJSONArray(vaultRoot.appendingPathComponent("handovers.json")) else { return false }
+    return items.contains { ($0["undone"] as? Bool) != true }
+}
+
+func readJSONArray(_ url: URL) -> [[String: Any]]? {
+    guard let data = try? Data(contentsOf: url),
+          let items = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+        return nil
+    }
+    return items
+}
+
 // MARK: - 版本
 
 /// 构建时写进 Resources/build-info.txt（commit / built / 运行时源码指纹）。
@@ -323,26 +354,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let carry = NSMenuItem(title: "切换并带走当前会话", action: nil, keyEquivalent: "")
-        let carryMenu = NSMenu()
-        for account in accounts where account.uid != activeUid {
-            let item = NSMenuItem(
-                title: account.menuTitle,
-                action: #selector(switchWithCurrent(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = account.uid
-            carryMenu.addItem(item)
+        // 会话共享：切账号不再换一批会话，本机所有会话跟着走
+        let share = menuItem(
+            shareEnabled() ? "切换时保留全部会话：开" : "切换时保留全部会话：关",
+            #selector(toggleShare)
+        )
+        share.state = shareEnabled() ? .on : .off
+        menu.addItem(share)
+        menu.addItem(menuItem("立即共享全部会话", #selector(shareNow)))
+        if hasOwnershipRecord() {
+            menu.addItem(menuItem("恢复会话原始归属", #selector(unshareNow)))
         }
-        if carryMenu.items.isEmpty {
-            let none = NSMenuItem(title: "没有其他账号", action: nil, keyEquivalent: "")
-            none.isEnabled = false
-            carryMenu.addItem(none)
+        if hasHandoverRecord() {
+            menu.addItem(menuItem("撤销上次会话过继", #selector(undoHandover)))
         }
-        carry.submenu = carryMenu
-        menu.addItem(carry)
-        menu.addItem(menuItem("撤销上次会话过继", #selector(undoHandover)))
 
         let hint = NSMenuItem(
             title: accounts.count < 2 ? "再登录一个账号，会自动收录" : "点账号即可切换",
@@ -436,9 +461,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runAsync(["switch", uid, "--wait", "3"], successFlash: "已切换")
     }
 
-    @objc func switchWithCurrent(_ sender: NSMenuItem) {
-        guard let uid = sender.representedObject as? String else { return }
-        runAsync(["switch", uid, "--with-current", "--wait", "3"], successFlash: "已带走")
+    @objc func toggleShare() {
+        let on = !shareEnabled()
+        runAsync(["config", "share", on ? "on" : "off"], successFlash: on ? "已开启共享" : "已关闭共享")
+    }
+
+    @objc func shareNow() {
+        runAsync(["share"], successFlash: "已共享")
+    }
+
+    @objc func unshareNow() {
+        runAsync(["unshare"], successFlash: "已恢复")
     }
 
     @objc func undoHandover() {
@@ -630,6 +663,7 @@ if arguments.contains("--status") {
     print("watcher: \(isWatcherRunning() ? "running" : "stopped")")
     print("loginItem: \(loginItemInstalled() ? "on" : "off")")
     print("accounts: \(loadAccounts().count)")
+    print("share: \(shareEnabled() ? "on" : "off")")
     print("autoRetry: \(AutoRetry.shared.enabled ? "on" : "off")")
     print("autoRollover: \(Rollover.shared.enabled ? "on" : "off")")
     if !Rollover.shared.lastMessage.isEmpty { print("rollover: \(Rollover.shared.lastMessage)") }
