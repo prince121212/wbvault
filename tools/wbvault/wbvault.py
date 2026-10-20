@@ -306,12 +306,31 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
             print(fmt.paint("  · %s" % message, fmt.DIM))
 
     db = handover_mod.db_path(getattr(args, "db", None))
-    entry = vault.find(args.selector)
-    target_uid = str(entry["uid"]) if entry else ""
     try:
-        previous_uid = read_state(auth_file).uid
+        current_state = read_state(auth_file)
+        previous_uid = current_state.uid
     except AuthFileError:
+        current_state = None
         previous_uid = vault.active_uid() or ""
+
+    # 目标能不能切，必须先验完再动会话归属。
+    # 共享和过继都是不可逆的库改动：排在 switch() 之后校验就晚了——会话已经归到
+    # 目标账号名下、登录态却因为快照校验失败没切过去，用户会以为会话丢了。
+    entry, _target, problem = resolve_target(
+        vault,
+        auth_file,
+        args.selector,
+        allow_domain_mismatch=args.allow_domain_mismatch,
+        current=current_state,
+        repair=not args.dry_run,
+    )
+    if problem is not None:
+        if args.json:
+            print_json(problem.to_dict())
+        else:
+            print(fmt.paint(problem.message, fmt.YELLOW))
+        return problem.exit_code
+    target_uid = str(entry["uid"]) if entry else ""
 
     share_on = args.share if getattr(args, "share", None) is not None else vault.share_enabled()
     keep_route = (
@@ -320,28 +339,8 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
 
     carried = None
     if getattr(args, "with_current", False):
-        # 但「过继」是不可逆的库改动，必须排在目标校验之后：
-        # 否则会话已经改到目标账号名下、登录态却因为快照校验失败没切过去，
-        # 用户会以为会话丢了（实际是挂在了没登录的号上）。
-        try:
-            current = read_state(auth_file)
-        except AuthFileError:
-            current = None
-        _entry, _target, problem = resolve_target(
-            vault,
-            auth_file,
-            args.selector,
-            allow_domain_mismatch=args.allow_domain_mismatch,
-            current=current,
-            repair=not args.dry_run,
-        )
-        if problem is not None:
-            if args.json:
-                print_json(problem.to_dict())
-            else:
-                print(fmt.paint(problem.message, fmt.YELLOW))
-            return problem.exit_code
-        entry = vault.find(args.selector)
+        # 目标已在上面校验过，这里只决定「共享」还是「单条过继」。
+        # 过继是不可逆的库改动，绝不能跑在校验之前。
         if share_on:
             # 共享模式下所有会话都跟着走，单条过继反而是「把它变回私有」，不做
             log("已开启会话共享：切换后所有会话都在，不再单独过继当前会话")
@@ -366,8 +365,24 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
 
     # 先把会话归到目标账号，再写登录态：App 收到登录态变更会立刻重读侧边栏，
     # 写晚了这一轮就看不到新会话（得再触发一次刷新）。
+    # 动手之前记下「每条会话原本归谁」，回滚时按这份精确还原——
+    # 用「整表归到上一个账号」兜底会把第三个账号的会话也搬走。
     shared = None
-    if share_on and target_uid and target_uid != previous_uid:
+    before = None
+    can_share = bool(share_on and target_uid and target_uid != previous_uid)
+    if can_share and not args.dry_run:
+        try:
+            before = share_mod.capture_owners(db)
+        except Exception as exc:  # noqa: BLE001 - 记不下原样就别共享，免得回不去
+            if not args.json:
+                print(
+                    fmt.paint(
+                        "  · 读不到会话库（%s），已跳过共享，登录态照常切换" % exc, fmt.YELLOW
+                    )
+                )
+            can_share = False
+
+    if can_share:
         shared = share_mod.claim_all(vault, db, target_uid, dry_run=args.dry_run)
         if not args.json:
             color = fmt.DIM if shared.status in ("ok", "noop") else fmt.RED
@@ -375,6 +390,23 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         if shared.status == "error" and not args.force:
             print(fmt.paint("  · 会话没能共享，已中止切换（登录态未改动）", fmt.YELLOW))
             return EXIT_FAILED
+
+    def undo_share(reason: str) -> None:
+        """按切换前的原样把会话归属还回去。"""
+        if before is None:
+            return
+        try:
+            moved_back = share_mod.restore_exact(vault, db, before)
+        except Exception as exc:  # noqa: BLE001 - 还原失败要给出兜底路径
+            if not args.json:
+                print(
+                    fmt.paint(
+                        "  · 会话没能还原（%s），可运行 wbvault unshare 兜底" % exc, fmt.RED
+                    )
+                )
+            return
+        if not args.json and moved_back:
+            print(fmt.paint("  · %s：已按原样还原 %d 条会话归属" % (reason, moved_back), fmt.YELLOW))
 
     try:
         result = switch(
@@ -389,20 +421,16 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
             log=log,
         )
     except Exception:
-        if shared is not None and shared.status == "ok" and previous_uid:
-            share_mod.claim_all(vault, db, previous_uid)
+        undo_share("切换中断")
         raise
 
     # 登录态没切成（拒绝 / 回滚 / 出错）：会话要还回原账号，否则原账号侧边栏会空掉
-    if (
-        shared is not None
-        and shared.status == "ok"
-        and result.status in ("refused", "rolled_back", "error")
-        and previous_uid
+    if shared is not None and shared.status == "ok" and result.status in (
+        "refused",
+        "rolled_back",
+        "error",
     ):
-        back = share_mod.claim_all(vault, db, previous_uid)
-        if not args.json:
-            print(fmt.paint("  · 会话已还回 %s（%s）" % (previous_uid[:8], back.status), fmt.YELLOW))
+        undo_share("切换未成功")
 
     # 切完还停在同一页：把「当前打开的是哪个会话」抄给目标账号
     if (

@@ -54,6 +54,7 @@ def make_auth(uid: str, uin: str, domain: str = "www.workbuddy.ai", token: str =
 
 UID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 UID_B = "bbbbbbbb-1111-2222-3333-555555555555"
+UID_C = "cccccccc-3333-3333-3333-666666666666"
 
 
 class BaseCase(unittest.TestCase):
@@ -615,6 +616,98 @@ class TestSwitchWithCurrent(BaseCase):
         conn.close()
         self.assertEqual(owner, UID_A, "会话不该被过继到切不过去的账号")
         self.assertEqual(read_state(self.auth_file).uid, UID_A)
+
+
+class TestRollbackFidelity(BaseCase):
+    """切换失败要按原样还原：本机有第三个账号时，不能把它的会话也一起搬走。"""
+
+    def _make_db(self) -> Path:
+        import sqlite3
+
+        db = self.tmp / "workbuddy.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "create table sessions (id text primary key, user_id text, title text, cwd text, "
+            "transport text default 'local', status text, deleted_at integer, "
+            "last_activity_at integer, created_at integer, is_playground integer default 0)"
+        )
+        for sid, uid in (("s-a", UID_A), ("s-b", UID_B), ("s-c", UID_C)):
+            conn.execute(
+                "insert into sessions (id,user_id,title,cwd,transport,status,created_at,"
+                "last_activity_at) values (?,?,?,'/w','local','completed',1,1)",
+                (sid, uid, sid),
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    def _owners(self, db: Path) -> dict:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db))
+        try:
+            return dict(conn.execute("select id, user_id from sessions").fetchall())
+        finally:
+            conn.close()
+
+    def _add_snapshot(self, uid: str, uin: str, alias: str) -> None:
+        snap = self.vault.snapshot_path(uid)
+        snap.write_bytes(make_auth(uid, uin, token=uid[:1]))
+        os.chmod(snap, 0o600)
+        self.vault.snapshot(parse_state(snap), alias=alias)
+        # snapshot() 会把 activeUid 设成刚采集的账号，改回来模拟「A 正在用」
+        data = self.vault.load()
+        data["activeUid"] = UID_A
+        self.vault.save()
+
+    def test_refused_switch_leaves_third_account_alone(self) -> None:
+        """目标快照坏了被拒：三条会话的归属一个都不许动。"""
+        import wbvault
+        import wbvault_lib.share as share
+
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self._add_snapshot(UID_B, "2222222222", "B号")
+        self._add_snapshot(UID_C, "3333333333", "C号")
+        self.vault.snapshot_path(UID_B).write_bytes(b"tampered")
+        db = self._make_db()
+        before = self._owners(db)
+
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            code = wbvault.main(
+                [
+                    "--vault",
+                    str(self.vault.root),
+                    "--auth-file",
+                    str(self.auth_file),
+                    "switch",
+                    UID_B,
+                    "--db",
+                    str(db),
+                    "--wait",
+                    "0.2",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._owners(db), before, "被拒的切换不该改动任何会话归属（含第三方账号）"
+        )
+        self.assertEqual(read_state(self.auth_file).uid, UID_A)
+
+    def test_restore_exact_puts_each_session_back(self) -> None:
+        """capture_owners + restore_exact 能逐条还原，而不是整表归到一个账号。"""
+        import wbvault_lib.share as share
+
+        db = self._make_db()
+        before = share.capture_owners(db)
+
+        with mock.patch.object(share, "WORKBUDDY_HOME", self.tmp / "wb-home"):
+            share.claim_all(self.vault, db, UID_A, keep_backup=False)
+            self.assertEqual(set(self._owners(db).values()), {UID_A})
+            moved = share.restore_exact(self.vault, db, before)
+
+        self.assertEqual(moved, 2, "B、C 各一条需要还原")
+        self.assertEqual(self._owners(db), before)
 
 
 class TestShare(BaseCase):

@@ -238,6 +238,48 @@ def claim_all(
         conn.close()
 
 
+def capture_owners(db: Path) -> Dict[str, str]:
+    """记下此刻每条本地会话归谁。
+
+    切换失败要回滚时按这份快照精确还原。用「整表归到上一个账号」兜底是不行的：
+    本机有第三个账号时，它的会话会被一起搬走。
+    """
+    conn = connect(db)
+    try:
+        return {str(row["id"]): str(row["user_id"]) for row in _local_rows(conn)}
+    finally:
+        conn.close()
+
+
+def restore_exact(vault: Vault, db: Path, owners: Dict[str, str]) -> int:
+    """把会话归属还原成 capture_owners 记下的样子，只改真的变了的那些。"""
+    if not owners:
+        return 0
+    conn = connect(db)
+    try:
+        current = {str(row["id"]): str(row["user_id"]) for row in _local_rows(conn)}
+        moves = [
+            (sid, uid)
+            for sid, uid in owners.items()
+            # 期间被删掉的会话（current 里没有）不去复活它
+            if sid in current and current[sid] != uid
+        ]
+        if not moves:
+            return 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for sid, uid in moves:
+                conn.execute("update sessions set user_id = ? where id = ?", (uid, sid))
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+    invalidate_sidebars({uid for _sid, uid in moves} | set(owners.values()))
+    return len(moves)
+
+
 def restore_ownership(vault: Vault, db: Path, *, dry_run: bool = False) -> ShareResult:
     """按 ownership.json 把会话还回各自的第一任账号。"""
     data = load_ownership(vault)
