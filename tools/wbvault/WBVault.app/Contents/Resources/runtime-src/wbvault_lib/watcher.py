@@ -29,9 +29,8 @@ def scan_once(vault: Vault, auth_file: Path, log: Log = print) -> Dict[str, obje
     """检查一次；返回 {'event': ..., 'uid': ...}。"""
     if not auth_file.is_file():
         if vault.active_uid() is not None:
-            data = vault.load()
-            data["activeUid"] = None
-            vault.save()
+            # 锁内只改 activeUid：常驻进程不能整份覆盖别人写进去的索引
+            vault.set_active(None)
             log("检测到登出（登录态文件不存在），快照保留")
             return {"event": "logout"}
         return {"event": "idle"}

@@ -274,6 +274,63 @@ def _verify(
     return True, False, last_state
 
 
+def resolve_target(
+    vault: Vault,
+    auth_file: Path,
+    selector: str,
+    *,
+    allow_domain_mismatch: bool = False,
+    current: Optional[AuthState] = None,
+    repair: bool = True,
+) -> tuple:
+    """校验「能不能切到这个账号」，不写任何文件。
+
+    返回 (entry, target, None) 或 (None, None, SwitchResult)。
+    单独抽出来是为了让调用方**在过继会话之前**就能拦下必然失败的切换：
+    否则会话已经改到目标账号名下，登录态却没切过去，用户会以为会话丢了。
+    """
+    entry = vault.find(selector)
+    if not entry:
+        return None, None, SwitchResult(
+            "refused",
+            "账号库里没有这个账号：%s（先登录一次，或用 wbvault snapshot 采集）" % selector,
+            EXIT_USAGE,
+        )
+    target_uid = str(entry.get("uid", ""))
+    snap_path = vault.snapshot_path(target_uid)
+    if not snap_path.is_file():
+        return None, None, SwitchResult("refused", "目标快照文件缺失：%s" % snap_path, EXIT_USAGE)
+    if not vault.verify_snapshot(entry, repair=repair):
+        return None, None, SwitchResult(
+            "refused",
+            "目标快照校验失败（sha256 不一致），已拒绝切换。"
+            "若确认是索引过期，可先运行 wbvault repair",
+            EXIT_FAILED,
+        )
+    # verify_snapshot 可能顺手修好了索引，重新取一份最新的
+    entry = vault.find(selector) or entry
+    try:
+        target = read_state(snap_path)
+    except AuthFileError as exc:
+        return None, None, SwitchResult("refused", "目标快照无法解析：%s" % exc, EXIT_FAILED)
+    if target.uid != target_uid:
+        return None, None, SwitchResult("refused", "目标快照内部 uid 与索引不一致，已拒绝切换", EXIT_FAILED)
+    if (
+        current is not None
+        and target.domain
+        and current.domain
+        and target.domain != current.domain
+        and not allow_domain_mismatch
+    ):
+        return None, None, SwitchResult(
+            "refused",
+            "环境不一致：当前 %s，目标 %s。跨环境切换会导致登录态失效，"
+            "如确认要切请加 --allow-domain-mismatch" % (current.domain, target.domain),
+            EXIT_USAGE,
+        )
+    return entry, target, None
+
+
 def switch(
     vault: Vault,
     auth_file: Path,
@@ -297,37 +354,19 @@ def switch(
     if auto_restart is None:
         auto_restart = vault.auto_restart()
 
-    # ---------- 解析目标 ----------
-    entry = vault.find(selector)
-    if not entry:
-        return SwitchResult(
-            "refused",
-            "账号库里没有这个账号：%s（先登录一次，或用 wbvault snapshot 采集）" % selector,
-            EXIT_USAGE,
-        )
-    target_uid = str(entry.get("uid", ""))
-    snap_path = vault.snapshot_path(target_uid)
-    if not snap_path.is_file():
-        return SwitchResult("refused", "目标快照文件缺失：%s" % snap_path, EXIT_USAGE)
-    if not vault.verify_snapshot(entry):
-        return SwitchResult("refused", "目标快照校验失败（sha256 不一致），已拒绝切换", EXIT_FAILED)
-
-    try:
-        target = read_state(snap_path)
-    except AuthFileError as exc:
-        return SwitchResult("refused", "目标快照无法解析：%s" % exc, EXIT_FAILED)
-    if target.uid != target_uid:
-        return SwitchResult("refused", "目标快照内部 uid 与索引不一致，已拒绝切换", EXIT_FAILED)
-
-    # ---------- 环境一致性 ----------
-    if target.domain and current.domain and target.domain != current.domain:
-        if not allow_domain_mismatch:
-            return SwitchResult(
-                "refused",
-                "环境不一致：当前 %s，目标 %s。跨环境切换会导致登录态失效，"
-                "如确认要切请加 --allow-domain-mismatch" % (current.domain, target.domain),
-                EXIT_USAGE,
-            )
+    # ---------- 解析并校验目标 ----------
+    entry, target, problem = resolve_target(
+        vault,
+        auth_file,
+        selector,
+        allow_domain_mismatch=allow_domain_mismatch,
+        current=current,
+        repair=not dry_run,
+    )
+    if problem is not None:
+        return problem
+    assert entry is not None and target is not None
+    target_uid = target.uid
 
     # ---------- 空操作 ----------
     same_account = target.uid == current.uid and not force

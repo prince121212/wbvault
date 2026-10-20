@@ -44,6 +44,7 @@ from wbvault_lib.switch import (  # noqa: E402
     app_is_running,
     app_pid,
     probe_watcher_alive,
+    resolve_target,
     restart_app,
     restore_latest,
     switch,
@@ -185,6 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prune", help="清理多余备份")
     pr.add_argument("--keep", type=int, default=12)
 
+    rp = sub.add_parser("repair", help="体检并修复账号库索引（只动 accounts.json，不碰登录态）")
+    rp.add_argument("--dry-run", action="store_true", help="只报告，不写索引")
+
     return parser
 
 
@@ -302,12 +306,31 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
             print(fmt.paint("  · %s" % message, fmt.DIM))
 
     db = handover_mod.db_path(getattr(args, "db", None))
-    entry = vault.find(args.selector)
-    target_uid = str(entry["uid"]) if entry else ""
     try:
-        previous_uid = read_state(auth_file).uid
+        current_state = read_state(auth_file)
+        previous_uid = current_state.uid
     except AuthFileError:
+        current_state = None
         previous_uid = vault.active_uid() or ""
+
+    # 目标能不能切，必须先验完再动会话归属。
+    # 共享和过继都是不可逆的库改动：排在 switch() 之后校验就晚了——会话已经归到
+    # 目标账号名下、登录态却因为快照校验失败没切过去，用户会以为会话丢了。
+    entry, _target, problem = resolve_target(
+        vault,
+        auth_file,
+        args.selector,
+        allow_domain_mismatch=args.allow_domain_mismatch,
+        current=current_state,
+        repair=not args.dry_run,
+    )
+    if problem is not None:
+        if args.json:
+            print_json(problem.to_dict())
+        else:
+            print(fmt.paint(problem.message, fmt.YELLOW))
+        return problem.exit_code
+    target_uid = str(entry["uid"]) if entry else ""
 
     share_on = args.share if getattr(args, "share", None) is not None else vault.share_enabled()
     keep_route = (
@@ -316,6 +339,8 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
 
     carried = None
     if getattr(args, "with_current", False):
+        # 目标已在上面校验过，这里只决定「共享」还是「单条过继」。
+        # 过继是不可逆的库改动，绝不能跑在校验之前。
         if share_on:
             # 共享模式下所有会话都跟着走，单条过继反而是「把它变回私有」，不做
             log("已开启会话共享：切换后所有会话都在，不再单独过继当前会话")
@@ -340,8 +365,24 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
 
     # 先把会话归到目标账号，再写登录态：App 收到登录态变更会立刻重读侧边栏，
     # 写晚了这一轮就看不到新会话（得再触发一次刷新）。
+    # 动手之前记下「每条会话原本归谁」，回滚时按这份精确还原——
+    # 用「整表归到上一个账号」兜底会把第三个账号的会话也搬走。
     shared = None
-    if share_on and target_uid and target_uid != previous_uid:
+    before = None
+    can_share = bool(share_on and target_uid and target_uid != previous_uid)
+    if can_share and not args.dry_run:
+        try:
+            before = share_mod.capture_owners(db)
+        except Exception as exc:  # noqa: BLE001 - 记不下原样就别共享，免得回不去
+            if not args.json:
+                print(
+                    fmt.paint(
+                        "  · 读不到会话库（%s），已跳过共享，登录态照常切换" % exc, fmt.YELLOW
+                    )
+                )
+            can_share = False
+
+    if can_share:
         shared = share_mod.claim_all(vault, db, target_uid, dry_run=args.dry_run)
         if not args.json:
             color = fmt.DIM if shared.status in ("ok", "noop") else fmt.RED
@@ -349,6 +390,23 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
         if shared.status == "error" and not args.force:
             print(fmt.paint("  · 会话没能共享，已中止切换（登录态未改动）", fmt.YELLOW))
             return EXIT_FAILED
+
+    def undo_share(reason: str) -> None:
+        """按切换前的原样把会话归属还回去。"""
+        if before is None:
+            return
+        try:
+            moved_back = share_mod.restore_exact(vault, db, before)
+        except Exception as exc:  # noqa: BLE001 - 还原失败要给出兜底路径
+            if not args.json:
+                print(
+                    fmt.paint(
+                        "  · 会话没能还原（%s），可运行 wbvault unshare 兜底" % exc, fmt.RED
+                    )
+                )
+            return
+        if not args.json and moved_back:
+            print(fmt.paint("  · %s：已按原样还原 %d 条会话归属" % (reason, moved_back), fmt.YELLOW))
 
     try:
         result = switch(
@@ -363,20 +421,16 @@ def cmd_switch(vault: Vault, auth_file: Path, args) -> int:
             log=log,
         )
     except Exception:
-        if shared is not None and shared.status == "ok" and previous_uid:
-            share_mod.claim_all(vault, db, previous_uid)
+        undo_share("切换中断")
         raise
 
     # 登录态没切成（拒绝 / 回滚 / 出错）：会话要还回原账号，否则原账号侧边栏会空掉
-    if (
-        shared is not None
-        and shared.status == "ok"
-        and result.status in ("refused", "rolled_back", "error")
-        and previous_uid
+    if shared is not None and shared.status == "ok" and result.status in (
+        "refused",
+        "rolled_back",
+        "error",
     ):
-        back = share_mod.claim_all(vault, db, previous_uid)
-        if not args.json:
-            print(fmt.paint("  · 会话已还回 %s（%s）" % (previous_uid[:8], back.status), fmt.YELLOW))
+        undo_share("切换未成功")
 
     # 切完还停在同一页：把「当前打开的是哪个会话」抄给目标账号
     if (
@@ -573,6 +627,64 @@ def cmd_watch(vault: Vault, auth_file: Path, args) -> int:
 def cmd_prune(vault: Vault, args) -> int:
     removed = vault.prune_backups(args.keep)
     print("已清理 %d 个旧备份（保留 %d 个）" % (removed, args.keep))
+    return EXIT_OK
+
+
+def cmd_repair(vault: Vault, args) -> int:
+    """索引是派生数据：文件 + meta 才是事实。这里按事实把索引对齐。"""
+    if args.dry_run:
+        import hashlib
+
+        report = []
+        for entry in vault.entries():
+            uid = str(entry.get("uid", ""))
+            item = {"uid": uid, "alias": entry.get("alias") or "", "status": "ok", "detail": ""}
+            path = vault.snapshot_path(uid)
+            if not path.is_file():
+                item.update(status="missing", detail="快照文件不存在")
+            else:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual != entry.get("sha256"):
+                    if str(vault.read_meta(uid).get("sha256") or "") == actual:
+                        item.update(status="stale", detail="索引里的 sha256 过期（可修复）")
+                    else:
+                        item.update(status="corrupt", detail="文件与索引、meta 都不一致")
+            report.append(item)
+    else:
+        report = vault.repair()
+
+    bad = [r for r in report if r["status"] not in ("ok", "repaired", "stale")]
+    if args.json:
+        print_json({"ok": not bad, "accounts": report})
+        return EXIT_OK if not bad else EXIT_FAILED
+
+    labels = {
+        "ok": "正常",
+        "repaired": "已修复",
+        "stale": "索引过期",
+        "missing": "缺文件",
+        "corrupt": "损坏",
+        "error": "失败",
+    }
+    rows = [
+        [
+            r["alias"] or "-",
+            fmt.short_uid(r["uid"]),
+            labels.get(r["status"], r["status"]),
+            r["detail"] or "-",
+        ]
+        for r in report
+    ]
+    print(fmt.table(["别名", "uid", "状态", "说明"], rows))
+    fixed = sum(1 for r in report if r["status"] == "repaired")
+    if args.dry_run:
+        print(fmt.paint("\n[dry-run] 没有写入。需要修复请去掉 --dry-run", fmt.DIM))
+    elif fixed:
+        print(fmt.paint("\n已修复 %d 个账号的索引（快照文件未改动）" % fixed, fmt.GREEN))
+    if bad:
+        print(fmt.paint("\n有 %d 个账号的快照确实坏了，需要重新登录一次该账号再采集" % len(bad), fmt.RED))
+        return EXIT_FAILED
+    print(fmt.paint("\n账号库索引正常", fmt.GREEN))
     return EXIT_OK
 
 
@@ -1022,6 +1134,7 @@ def main(argv=None) -> int:
         "remove": lambda: cmd_remove(vault, args),
         "watch": lambda: cmd_watch(vault, auth_file, args),
         "prune": lambda: cmd_prune(vault, args),
+        "repair": lambda: cmd_repair(vault, args),
         "doctor": lambda: cmd_doctor(vault, auth_file, args.json, probe=getattr(args, "probe", False)),
         "sessions": lambda: cmd_sessions(vault, args),
         "share": lambda: cmd_share(vault, auth_file, args),
