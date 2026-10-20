@@ -381,10 +381,6 @@ class TestAtomicWrite(BaseCase):
         self.assertEqual(leftovers, [])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestHandover(BaseCase):
     def _make_db(self) -> Path:
         import sqlite3
@@ -501,3 +497,125 @@ class TestHandover(BaseCase):
         result = ho.handover(self.vault, db, "不存在的会话", UID_B)
         self.assertEqual(result.status, "error")
         self.assertIn("找不到会话", result.message)
+
+
+class TestIndexConsistency(BaseCase):
+    """索引是派生数据：常驻 watch 进程不能拿旧缓存覆盖别人的更新。"""
+
+    def _refresh_snapshot_file(self, uid: str, raw: bytes) -> None:
+        """模拟另一个进程写入了新快照（文件 + meta 都新，索引还没跟上）。"""
+        import hashlib
+
+        self.vault.snapshot_path(uid).write_bytes(raw)
+        meta = self.vault.read_meta(uid)
+        meta["sha256"] = hashlib.sha256(raw).hexdigest()
+        meta["size"] = len(raw)
+        self.vault.meta_path(uid).write_text(json.dumps(meta), "utf-8")
+
+    def test_stale_index_is_repaired_not_rejected(self) -> None:
+        import hashlib
+
+        entry = self.vault.snapshot(read_state(self.auth_file))
+        new_raw = make_auth(UID_A, "1111111111", token="refreshed")
+        self._refresh_snapshot_file(UID_A, new_raw)
+        # 索引里还是旧 sha —— 这就是报「sha256 不一致」的那种状态
+        self.assertNotEqual(entry["sha256"], hashlib.sha256(new_raw).hexdigest())
+
+        self.assertTrue(self.vault.verify_snapshot(self.vault.find(UID_A)))
+        self.assertEqual(
+            self.vault.find(UID_A)["sha256"], hashlib.sha256(new_raw).hexdigest()
+        )
+
+    def test_real_corruption_still_rejected(self) -> None:
+        self.vault.snapshot(read_state(self.auth_file))
+        self.vault.snapshot_path(UID_A).write_bytes(b"tampered")
+        self.assertFalse(self.vault.verify_snapshot(self.vault.find(UID_A)))
+
+    def test_long_lived_instance_keeps_other_writes(self) -> None:
+        """常驻进程先加载索引、之后别的进程加了账号：再保存时不能把它抹掉。"""
+        daemon = Vault(self.vault.root)
+        daemon.snapshot(read_state(self.auth_file))
+
+        other = Vault(self.vault.root)
+        snap_b = other.snapshot_path(UID_B)
+        snap_b.write_bytes(make_auth(UID_B, "2222222222", token="b"))
+        other.snapshot(parse_state(snap_b))
+
+        refreshed = make_auth(UID_A, "1111111111", token="a2")
+        self.auth_file.write_bytes(refreshed)
+        daemon.snapshot(read_state(self.auth_file))
+
+        uids = {e["uid"] for e in Vault(self.vault.root).entries()}
+        self.assertEqual(uids, {UID_A, UID_B})
+        fresh = Vault(self.vault.root)
+        self.assertTrue(fresh.verify_snapshot(fresh.find(UID_A)))
+        self.assertTrue(fresh.verify_snapshot(fresh.find(UID_B)))
+
+    def test_resolve_target_refuses_corrupt_snapshot(self) -> None:
+        self.vault.snapshot(read_state(self.auth_file))
+        self.vault.snapshot_path(UID_A).write_bytes(b"tampered")
+        entry, target, problem = sw.resolve_target(self.vault, self.auth_file, UID_A)
+        self.assertIsNone(entry)
+        self.assertIsNone(target)
+        self.assertIsNotNone(problem)
+        self.assertEqual(problem.status, "refused")
+        self.assertEqual(problem.exit_code, sw.EXIT_FAILED)
+
+
+class TestSwitchWithCurrent(BaseCase):
+    """过继会话必须排在目标校验之后：切不过去就别动会话归属。"""
+
+    def _make_db(self) -> Path:
+        import sqlite3
+
+        db = self.tmp / "workbuddy.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "create table sessions (id text primary key, user_id text, title text, cwd text, "
+            "transport text default 'local', status text, deleted_at integer, "
+            "last_activity_at integer, created_at integer)"
+        )
+        conn.execute(
+            "insert into sessions (id,user_id,title,transport,status,created_at) "
+            "values ('sess-0001', ?, '开始新对话', 'local', 'completed', 1)",
+            (UID_A,),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_broken_target_does_not_handover_session(self) -> None:
+        import sqlite3
+
+        import wbvault
+
+        self.vault.snapshot(read_state(self.auth_file), alias="A号")
+        self.add_b_snapshot()
+        self.vault.snapshot_path(UID_B).write_bytes(b"tampered")
+        db = self._make_db()
+
+        code = wbvault.main(
+            [
+                "--vault",
+                str(self.vault.root),
+                "--auth-file",
+                str(self.auth_file),
+                "switch",
+                UID_B,
+                "--with-current",
+                "--db",
+                str(db),
+                "--wait",
+                "0.2",
+            ]
+        )
+        self.assertEqual(code, 1)
+        conn = sqlite3.connect(str(db))
+        owner = conn.execute("select user_id from sessions").fetchone()[0]
+        conn.close()
+        self.assertEqual(owner, UID_A, "会话不该被过继到切不过去的账号")
+        self.assertEqual(read_state(self.auth_file).uid, UID_A)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
